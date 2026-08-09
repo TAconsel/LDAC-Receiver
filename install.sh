@@ -65,7 +65,7 @@ if [[ $MODE == uninstall ]]; then
 	say "Stopping and disabling services"
 	sudo systemctl disable --now bluealsa-aplay.service bluealsa.service \
 		bt-agent.service bluetooth-sink-setup.service ldac-web.service \
-		2>/dev/null || true
+		ldac-single-link.service 2>/dev/null || true
 
 	say "Removing the control panel"
 	sudo rm -rf "$WEB_DIR" /etc/sudoers.d/ldac-web /usr/local/sbin/ldac-ctl \
@@ -78,6 +78,7 @@ if [[ $MODE == uninstall ]]; then
 		/etc/systemd/system/bluetooth.service.d/override.conf \
 		/etc/systemd/system/bt-agent.service \
 		/etc/systemd/system/bluetooth-sink-setup.service \
+		/etc/systemd/system/ldac-single-link.service \
 		/etc/systemd/system/ldac-web.service
 	sudo rm -f /etc/asound.conf
 	# Back to the distribution bluetoothd.
@@ -318,19 +319,21 @@ sudo install -m 0644 "$HERE/config/bluetooth.service.d-override.conf" \
 	/etc/systemd/system/bluetooth.service.d/override.conf
 sudo install -m 0644 "$HERE/config/bt-agent.service" \
 	"$HERE/config/bluetooth-sink-setup.service" \
+	"$HERE/config/ldac-single-link.service" \
 	"$HERE/config/ldac-web.service" /etc/systemd/system/
 
 sudo systemctl daemon-reload
 sudo systemctl restart bluetooth.service
 sudo systemctl enable --now bluetooth-sink-setup.service bt-agent.service \
-	bluealsa.service bluealsa-aplay.service ldac-web.service
-sudo systemctl restart bluealsa.service bluealsa-aplay.service ldac-web.service
+	ldac-single-link.service bluealsa.service bluealsa-aplay.service ldac-web.service
+sudo systemctl restart bluealsa.service bluealsa-aplay.service ldac-web.service \
+	ldac-single-link.service
 
 # --- verify -----------------------------------------------------------------
 say "Verifying"
 sleep 2
 fail=0
-for u in bluetooth bluealsa bluealsa-aplay bt-agent ldac-web; do
+for u in bluetooth bluealsa bluealsa-aplay bt-agent ldac-web ldac-single-link; do
 	if systemctl is-active --quiet "$u"; then
 		printf '  %-22s active\n' "$u"
 	else

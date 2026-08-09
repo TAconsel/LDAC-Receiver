@@ -16,6 +16,8 @@ Verbs:
     volume source panel|device  who drives the interface's volume control
     device connect|disconnect|trust|untrust|remove MAC
     apply-boot                  restore the persisted state at boot
+    watch-single-link           run in the foreground, holding the receiver to
+                                one connected device at a time
 
 SPDX-License-Identifier: MIT
 """
@@ -23,9 +25,11 @@ SPDX-License-Identifier: MIT
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 DEFAULTS = "/etc/default/ldac-receiver"
 BLUETOOTH_STATE = "/var/lib/bluetooth"
@@ -38,7 +42,13 @@ PCM_DSP = "dsp96"
 PCM_DIRECT = "ldac96"
 
 MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
-SERVICES = ("bluetooth", "bluealsa", "bluealsa-aplay", "bt-agent", "ldac-web")
+SERVICES = ("bluetooth", "bluealsa", "bluealsa-aplay", "bt-agent", "ldac-web",
+            "ldac-single-link")
+
+# How often watch-single-link looks at the adapter.  Two seconds is well under
+# the time it takes anyone to notice a second device connecting, and each pass
+# is two short commands.
+SINGLE_LINK_POLL_SECONDS = 2.0
 
 # The interface's own output attenuator, the same element BlueALSA would drive
 # if it were in mixer mode.  On the UMC404HD it is 128 steps of exactly 1 dB
@@ -57,9 +67,18 @@ VOLUME_MODE_DEVICE = "mixer"
 
 
 def run(argv, timeout=15):
-    """Run a command with no shell, returning (rc, stdout). Never raises."""
+    """Run a command with no shell, returning (rc, stdout). Never raises.
+
+    input="" matters more than it looks.  btmgmt is built on BlueZ's bt_shell,
+    which produces *no output at all* — exit status 0, empty stdout — when its
+    stdin is /dev/null, and /dev/null is exactly what systemd hands a service.
+    Every btmgmt call from a unit therefore came back blank, which read as "the
+    adapter has no flags set" rather than as a failure.  Passing input= gives
+    the child a pipe that closes immediately, which bt_shell is happy with.
+    """
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           input="", timeout=timeout)
         return p.returncode, p.stdout
     except (OSError, subprocess.SubprocessError):
         return -1, ""
@@ -182,23 +201,110 @@ def paired_devices():
     return devices
 
 
-def adapter_state():
+def single_link_active():
+    rc, out = run(["systemctl", "is-active", "ldac-single-link"])
+    return out.strip() == "active"
+
+
+def apply_link_gate():
+    """Make the adapter reachable only when no device is connected.
+
+    A device already paired is not stopped from *reconnecting* by anything in
+    BlueZ — there is no "maximum connections" setting — so the only way to hold
+    the box to one device is to stop advertising and stop accepting connections
+    while one is in use, and put both back when it leaves.
+
+    Written as "work out what the state should be, then fix what differs" rather
+    than "act on transitions", so it repairs itself if something else changes
+    the adapter behind our back, and does nothing at all in the steady state.
+
+    Returns the address being kept, or None.
+    """
+    live = connected_macs()
+    # Deterministic choice if two arrive together; the loser is disconnected
+    # below and can come back once the winner leaves.
+    primary = sorted(live)[0] if live else None
+
+    for mac in sorted(m for m in live if m != primary):
+        run(["bluetoothctl", "disconnect", mac], timeout=20)
+
+    want_connectable = primary is None
+    want_discoverable = (primary is None and
+                         read_defaults().get("LDAC_DISCOVERABLE", "on") == "on")
+
+    # adapter_flags(), not adapter_state(): the latter reports whether *this*
+    # service is active, which means shelling out to systemctl about the unit
+    # the loop is running inside.  That is fine for a one-shot status call and
+    # much too slow to do on every pass of a control loop.
+    flags = adapter_flags()
+    if not flags:
+        # The adapter state could not be read.  Setting it anyway is harmless
+        # and idempotent; treating "no flags" as "nothing needs changing" is
+        # how this silently did nothing for a while.
+        run(["btmgmt", "connectable", "on" if want_connectable else "off"])
+        run(["btmgmt", "discov", "on" if want_discoverable else "off"])
+        return primary
+    if ("connectable" in flags) != want_connectable:
+        run(["btmgmt", "connectable", "on" if want_connectable else "off"])
+    if ("discoverable" in flags) != want_discoverable:
+        run(["btmgmt", "discov", "on" if want_discoverable else "off"])
+    return primary
+
+
+def cmd_watch_single_link():
+    stopping = {"now": False}
+
+    def stop(_signum, _frame):
+        stopping["now"] = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    while not stopping["now"]:
+        apply_link_gate()
+        time.sleep(SINGLE_LINK_POLL_SECONDS)
+
+    # Leave the adapter reachable on the way out, or stopping this service would
+    # quietly leave the box unable to accept any connection at all.
+    run(["btmgmt", "connectable", "on"])
+    if read_defaults().get("LDAC_DISCOVERABLE", "on") == "on":
+        run(["btmgmt", "discov", "on"])
+    return {"ok": True}
+
+
+def adapter_info():
+    """Raw `btmgmt info` output, plus the current-settings flags."""
     _, out = run(["btmgmt", "info"])
     settings = ""
     for line in out.splitlines():
         if "current settings:" in line:
             settings = line.split("current settings:", 1)[1]
             break
+    return out, settings.split()
+
+
+def adapter_flags():
+    return adapter_info()[1]
+
+
+def adapter_state():
+    out, flags = adapter_info()
     addr = re.search(r"addr ((?:[0-9A-F]{2}:){5}[0-9A-F]{2})", out, re.I)
     name = re.search(r"^\s*name (.+)$", out, re.M)
-    flags = settings.split()
     return {
         "address": addr.group(1).upper() if addr else None,
         "name": name.group(1).strip() if name else None,
         "powered": "powered" in flags,
+        # The live radio state ...
         "discoverable": "discoverable" in flags,
         "bondable": "bondable" in flags,
         "connectable": "connectable" in flags,
+        # ... and what was actually asked for, which differ while the box is
+        # holding itself closed for a connected device.  The panel shows the
+        # setting, so its switch does not appear to flip on its own.
+        "discoverable_setting": read_defaults().get("LDAC_DISCOVERABLE", "on") == "on",
+        "single_link": single_link_active(),
+        "occupied": bool(connected_macs()),
     }
 
 
@@ -416,9 +522,14 @@ def cmd_convolution(word):
 def cmd_discoverable(word):
     on = want_on(word)
     write_defaults({"LDAC_DISCOVERABLE": "on" if on else "off"})
-    rc, _ = run(["btmgmt", "discov", "on" if on else "off"])
-    if rc != 0:
-        fail("btmgmt discov failed")
+    if single_link_active():
+        # Let the gate decide: with a device connected the setting is saved but
+        # the radio stays closed until it leaves.
+        apply_link_gate()
+    else:
+        rc, _ = run(["btmgmt", "discov", "on" if on else "off"])
+        if rc != 0:
+            fail("btmgmt discov failed")
     return {"ok": True, "adapter": adapter_state()}
 
 
@@ -480,6 +591,8 @@ def main(argv):
         result = cmd_device(args[0], args[1])
     elif verb == "apply-boot" and not args:
         result = cmd_apply_boot()
+    elif verb == "watch-single-link" and not args:
+        result = cmd_watch_single_link()
     else:
         fail("unknown verb or wrong number of arguments: %r" % (argv,))
     json.dump(result, sys.stdout)

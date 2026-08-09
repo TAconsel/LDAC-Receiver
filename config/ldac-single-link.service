@@ -1,0 +1,26 @@
+# Installed as /etc/systemd/system/ldac-single-link.service
+#
+# Holds the receiver to one connected device at a time.
+#
+# BlueZ has no "maximum connections" setting, and a device that is already
+# paired will happily reconnect whenever it likes, so the only way to keep the
+# box to a single link is to stop advertising and stop accepting connections
+# while one is in use, and put both back when it leaves.  That is what this
+# does, and it disconnects a second device if one gets in during the gap.
+#
+# Stopping this service deliberately reopens the adapter, so the box is never
+# left unable to accept a connection because the watcher went away.
+
+[Unit]
+Description=Hold the LDAC receiver to a single Bluetooth link
+After=bluetooth.service bluetooth-sink-setup.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ldac-ctl watch-single-link
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=bluetooth.target

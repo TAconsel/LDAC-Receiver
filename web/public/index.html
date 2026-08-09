@@ -421,11 +421,21 @@ function render(s) {
         : 'starts with playback'}`
     : 'Bypassed — audio goes straight to the interface';
 
-  $('disc').checked = !!a.discoverable;
+  // Bound to the saved setting, not the live radio state: with single-link
+  // enforcement the radio is closed while a device is connected, and a switch
+  // that flipped itself off whenever someone connected would look broken.
+  const wants = 'discoverable_setting' in a ? a.discoverable_setting : a.discoverable;
+  $('disc').checked = !!wants;
   $('disc').disabled = busy;
-  $('dischint').textContent = a.discoverable
-    ? 'Visible to nearby devices, and accepting new pairings'
-    : 'Hidden. Already-paired clients can still connect.';
+  if (a.single_link && a.occupied) {
+    $('dischint').textContent = wants
+      ? 'Held off while a device is connected — one device at a time.'
+      : 'Hidden, and closed anyway while a device is connected.';
+  } else {
+    $('dischint').textContent = wants
+      ? 'Visible to nearby devices, and accepting new pairings'
+      : 'Hidden. Already-paired clients can still connect.';
+  }
 
   renderVolume(s.volume);
   renderFacts(s);

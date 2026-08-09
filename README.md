@@ -70,6 +70,7 @@ the service at the rebuilt one in `/usr/local/libexec`.
 | `/etc/systemd/system/*.service.d/override.conf` | service arguments |
 | `/etc/systemd/system/bt-agent.service` | headless pairing agent |
 | `/etc/systemd/system/bluetooth-sink-setup.service` | discoverable + pairable at boot |
+| `/etc/systemd/system/ldac-single-link.service` | holds the box to one device |
 | `/usr/local/bin/node`, `/usr/local/share/ldac-web/` | the control panel |
 | `/usr/local/sbin/ldac-ctl` | its privileged half |
 | `/etc/default/ldac-receiver` | settings the panel writes |
@@ -270,6 +271,42 @@ despite not being documented as such. What is left is the namespace and mount
 half, which is the part that matters: a read-only system, no home directories,
 private `/tmp`. `ReadWritePaths=/etc/default` is the single hole, because the
 mount namespace applies to the sudo'd helper too and it has to save settings.
+
+## One device at a time
+
+The receiver takes a single connection. While a device is connected the adapter
+is neither connectable nor discoverable, so nothing else can attach; both are
+restored within about two seconds of it disconnecting. If a second device does
+get in during that gap, it is disconnected.
+
+This is `ldac-single-link.service`, a small loop in `ldac-ctl`. It has to work
+that way because BlueZ has no maximum-connections setting and a paired device
+will reconnect whenever it likes, so the only lever is to stop advertising and
+stop accepting connections while the box is in use. Stopping the service
+deliberately reopens the adapter, so the box is never left unreachable because
+the watcher went away.
+
+The panel's **Discoverable** switch shows the setting you chose, not the
+momentary radio state — otherwise it would appear to switch itself off every
+time someone connected. While a device is connected it reads "held off".
+
+To allow several devices to connect again:
+
+```sh
+sudo systemctl disable --now ldac-single-link
+```
+
+Note that only one can actually *play*: CamillaDSP opens the sound card
+exclusively, so a second stream fails to open it and stays silent. Mixing them
+through an ALSA `dmix` was tried and reverted — see the git history.
+
+**A trap worth knowing if you script anything with `btmgmt`.** It is built on
+BlueZ's `bt_shell`, and with its stdin on `/dev/null` it prints **nothing** and
+still exits 0 — which is exactly what systemd hands a service. Every `btmgmt`
+call made from a unit therefore came back blank, and code that read the result
+as "the adapter has no flags set" silently did nothing at all. `ldac-ctl` gives
+every child an empty pipe instead, which `bt_shell` is happy with. This also
+fixes `bluetooth-sink-setup.service`, whose `btmgmt` calls had the same problem.
 
 ## Pairing
 
