@@ -1,0 +1,64 @@
+# Installed as /etc/systemd/system/ldac-web.service
+#
+# The control panel.  Runs unprivileged as `ldacweb`; the only privileged thing
+# it can do is run /usr/local/sbin/ldac-ctl through sudo, which /etc/sudoers.d
+# permits and which validates its own arguments.
+#
+# To require a shared secret, set it here and reach the panel once as
+# http://<host>:8080/?token=... — the page keeps it for the session:
+#
+#     $ sudo systemctl edit ldac-web
+#     [Service]
+#     Environment=LDAC_WEB_TOKEN=some-long-random-string
+#
+# LDAC_WEB_BIND=127.0.0.1 restricts it to the box itself if you would rather
+# reach it over an SSH tunnel than expose it to the network at all.
+
+[Unit]
+Description=LDAC receiver control panel
+After=network.target bluealsa.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=ldacweb
+Group=ldacweb
+Environment=LDAC_WEB_PORT=8080
+Environment=LDAC_WEB_BIND=0.0.0.0
+ExecStart=/usr/local/bin/node /usr/local/share/ldac-web/server.js
+Restart=on-failure
+RestartSec=3
+
+# Sandboxing.
+#
+# This service has to be able to run sudo, and sudo is setuid, so anything that
+# turns on NoNewPrivileges would break it with a confusing "effective uid is not
+# 0" error.  Every seccomp-based hardening option implies NoNewPrivileges=yes —
+# PrivateDevices, ProtectClock, ProtectKernel*, RestrictAddressFamilies,
+# RestrictNamespaces, RestrictRealtime, RestrictSUIDSGID, LockPersonality,
+# SystemCallFilter, SystemCallArchitectures — and the implication cannot be
+# undone by setting NoNewPrivileges=no.  So they are all absent by necessity.
+#
+# What remains is the namespace and mount based half, which is the part that
+# matters most here: the panel gets a read-only view of the system, no access to
+# anyone's home directory, and a private /tmp.  The real containment is that
+# sudo will only run one root-owned script, which validates its own arguments.
+#
+# ProtectHostname is absent for the same reason, found the hard way: on this
+# systemd it also leaves sudo unable to gain privileges, with the same message,
+# even though the documentation does not list it as implying NoNewPrivileges.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectProc=default
+UMask=0077
+
+# The mount namespace applies to everything started from here, sudo included, so
+# ldac-ctl would find /etc read-only and be unable to save the panel's settings.
+# This is the one directory it writes, and only root can write inside it — the
+# panel's own user still cannot touch the root-owned file there.
+ReadWritePaths=/etc/default
+
+[Install]
+WantedBy=multi-user.target

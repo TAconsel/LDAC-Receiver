@@ -1,0 +1,16 @@
+# Runtime state for the LDAC receiver, installed as /etc/default/ldac-receiver.
+#
+# The web control panel rewrites this file through /usr/local/sbin/ldac-ctl and
+# it is read back by bluealsa-aplay.service (as an EnvironmentFile) and by
+# bluetooth-sink-setup.service at boot.  Editing it by hand works too; run
+# `systemctl restart bluealsa-aplay` afterwards for LDAC_PCM to take effect.
+
+# Which ALSA PCM from /etc/asound.conf receives the decoded Bluetooth audio:
+#   dsp96  - through CamillaDSP room correction (default)
+#   ldac96 - straight to the interface, correction bypassed
+LDAC_PCM=dsp96
+
+# Whether the adapter is discoverable, restored at boot. Pairing also requires
+# it; leaving it off makes the box invisible to devices that are not already
+# bonded.
+LDAC_DISCOVERABLE=on

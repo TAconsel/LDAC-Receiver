@@ -1,0 +1,12 @@
+# Installed as /etc/sudoers.d/ldac-web, mode 0440.
+#
+# The control panel runs as an unprivileged user and may run exactly one
+# program: /usr/local/sbin/ldac-ctl, which accepts a fixed set of verbs and
+# validates its own arguments.  There is deliberately no wildcard beyond the
+# script's own argument checking, and no shell is involved anywhere in the path
+# from an HTTP request to a privileged action.
+#
+# ldac-ctl must stay root-owned and not writable by ldacweb, or this rule would
+# hand over the whole machine.
+
+ldacweb ALL=(root) NOPASSWD: /usr/local/sbin/ldac-ctl

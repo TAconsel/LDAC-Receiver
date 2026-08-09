@@ -70,6 +70,9 @@ the service at the rebuilt one in `/usr/local/libexec`.
 | `/etc/systemd/system/*.service.d/override.conf` | service arguments |
 | `/etc/systemd/system/bt-agent.service` | headless pairing agent |
 | `/etc/systemd/system/bluetooth-sink-setup.service` | discoverable + pairable at boot |
+| `/usr/local/bin/node`, `/usr/local/share/ldac-web/` | the control panel |
+| `/usr/local/sbin/ldac-ctl` | its privileged half |
+| `/etc/default/ldac-receiver` | settings the panel writes |
 
 PulseAudio is masked: it registers competing A2DP endpoints with BlueZ and would
 hold the sound card. This board is a headless appliance, so it is switched off
@@ -161,6 +164,81 @@ single priming event.
 against glibc 2.34 and will not start on bullseye (glibc 2.31) — they fail at
 exec with `GLIBC_2.34 not found`. `install.sh` checks this and stops with an
 explanation.
+
+## Control panel
+
+`http://<box>:8080/` — room correction on/off, Bluetooth discoverable on/off,
+and the paired clients (connect, disconnect, trust, remove), with the live codec,
+sample rate and output format. It polls every 5 seconds and stops while the tab
+is hidden.
+
+**Read this before putting it on your network: there is no password by
+default.** Anyone who can reach the port can unpair your devices and toggle the
+audio path. That is a reasonable default for a receiver on a home LAN and a bad
+one anywhere else. Two ways to tighten it:
+
+```sh
+sudo systemctl edit ldac-web        # then add one of:
+
+[Service]
+Environment=LDAC_WEB_TOKEN=some-long-random-string   # then open /?token=...
+
+[Service]
+Environment=LDAC_WEB_BIND=127.0.0.1                  # reachable only via SSH tunnel
+```
+
+The page keeps a token in `sessionStorage` and strips it from the address bar,
+so it is not left in browser history.
+
+**Privilege model.** The panel runs as `ldacweb`, an unprivileged system account
+with no shell. The one privileged thing it can do is run
+`/usr/local/sbin/ldac-ctl` through sudo — a root-owned script with a fixed verb
+set that validates its own arguments. Requests are mapped onto that verb table
+in the server as well, so a bad value is rejected before it reaches sudo, and
+`execFile` is used throughout: no shell is involved anywhere between an HTTP
+request and a privileged action. A Bluetooth address that is not exactly a
+Bluetooth address is refused at both layers.
+
+`ldac-ctl` is a normal command-line tool too, which is often quicker than the
+browser:
+
+```sh
+sudo ldac-ctl status                     # everything, as JSON
+sudo ldac-ctl convolution off            # bypass room correction
+sudo ldac-ctl discoverable off           # hide the adapter
+sudo ldac-ctl device remove AA:BB:CC:DD:EE:FF
+```
+
+**Settings live in `/etc/default/ldac-receiver`** and survive reboots.
+`bluealsa-aplay.service` reads `LDAC_PCM` from it as an `EnvironmentFile`, which
+is why switching correction on and off is a one-line rewrite plus a service
+restart rather than an edit to a unit. `bluetooth-sink-setup.service` restores
+`LDAC_DISCOVERABLE` at boot. Editing the file by hand works; run
+`systemctl restart bluealsa-aplay` afterwards.
+
+**Toggling correction restarts the player**, so audio stops for a moment and the
+sender may need a second to resume. That is inherent — CamillaDSP owns the sound
+card exclusively, so the path cannot be swapped underneath a running stream.
+
+**API**, if you would rather script it than click:
+
+| | |
+| --- | --- |
+| `GET /api/status` | everything the page shows |
+| `POST /api/convolution` | `{"enabled": true\|false}` |
+| `POST /api/discoverable` | `{"enabled": true\|false}` |
+| `POST /api/device` | `{"action": "connect\|disconnect\|trust\|untrust\|remove", "mac": "…"}` |
+
+**systemd sandboxing note.** `ldac-web.service` looks under-hardened on purpose.
+Every seccomp-based option — `PrivateDevices`, `ProtectKernel*`, `ProtectClock`,
+`RestrictAddressFamilies`, `RestrictNamespaces`, `RestrictSUIDSGID`,
+`LockPersonality`, `SystemCallArchitectures` — implies `NoNewPrivileges=yes`,
+which stops sudo from working at all (`effective uid is not 0`), and that
+implication cannot be undone. `ProtectHostname` turned out to do the same here
+despite not being documented as such. What is left is the namespace and mount
+half, which is the part that matters: a read-only system, no home directories,
+private `/tmp`. `ReadWritePaths=/etc/default` is the single hole, because the
+mount namespace applies to the sudo'd helper too and it has to save settings.
 
 ## Pairing
 

@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LDAC Receiver</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #16181d;
+    --muted: #656b7a;
+    --line: #e2e5ea;
+    --accent: #2f6df6;
+    --good: #1a8b4a;
+    --good-bg: #e6f4ec;
+    --warn: #a15c00;
+    --warn-bg: #fbf0dd;
+    --bad: #c02626;
+    --bad-bg: #fbe9e9;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --card: #1c1f25; --ink: #e8eaee; --muted: #99a0ae;
+      --line: #2c313a; --accent: #6c9bff;
+      --good: #4ecb84; --good-bg: #17301f;
+      --warn: #e0a33c; --warn-bg: #322613;
+      --bad: #ff7a7a; --bad-bg: #33191b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.5rem 1rem 3rem;
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 46rem; margin: 0 auto; }
+  header { margin-bottom: 1.25rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 .15rem; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: .875rem; }
+  section {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 1rem 1.1rem; margin-bottom: 1rem;
+  }
+  h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .07em;
+       color: var(--muted); margin: 0 0 .8rem; font-weight: 600; }
+
+  .row { display: flex; align-items: center; gap: 1rem; }
+  .row + .row { margin-top: .9rem; padding-top: .9rem; border-top: 1px solid var(--line); }
+  .grow { flex: 1; min-width: 0; }
+  .label { font-weight: 600; }
+  .hint { color: var(--muted); font-size: .84rem; margin-top: .15rem; }
+
+  /* toggle */
+  .switch { position: relative; width: 46px; height: 26px; flex: none; }
+  .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+  .track {
+    position: absolute; inset: 0; background: var(--line); border-radius: 999px;
+    transition: background .15s ease; pointer-events: none;
+  }
+  .track::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px;
+    background: #fff; border-radius: 50%; transition: transform .15s ease;
+    box-shadow: 0 1px 3px rgba(0,0,0,.3);
+  }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::after { transform: translateX(20px); }
+  .switch input:disabled + .track { opacity: .5; }
+  .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* status grid */
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); gap: .8rem 1rem; }
+  .fact .k { color: var(--muted); font-size: .78rem; }
+  .fact .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* badges */
+  .badge {
+    display: inline-block; padding: .1rem .45rem; border-radius: 999px;
+    font-size: .74rem; font-weight: 600; white-space: nowrap;
+  }
+  .b-good { background: var(--good-bg); color: var(--good); }
+  .b-warn { background: var(--warn-bg); color: var(--warn); }
+  .b-bad  { background: var(--bad-bg);  color: var(--bad); }
+
+  /* clients */
+  .client + .client { margin-top: .7rem; padding-top: .7rem; border-top: 1px solid var(--line); }
+  .client .name { font-weight: 600; }
+  .mac { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; color: var(--muted); }
+  .actions { display: flex; gap: .4rem; flex-wrap: wrap; }
+  button {
+    font: inherit; font-size: .84rem; font-weight: 500; padding: .3rem .7rem;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink);
+    border-radius: 7px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
+
+  #toast {
+    position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);
+    background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: .55rem .9rem; box-shadow: 0 6px 24px rgba(0,0,0,.18);
+    max-width: min(90vw, 34rem); opacity: 0; transition: opacity .2s ease; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+  #toast.err { border-left-color: var(--bad); }
+  .empty { color: var(--muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="devname">LDAC Receiver</h1>
+    <div class="sub" id="devsub">connecting…</div>
+  </header>
+
+  <section>
+    <h2>Now playing</h2>
+    <div class="facts" id="facts"></div>
+  </section>
+
+  <section>
+    <h2>Audio</h2>
+    <div class="row">
+      <div class="grow">
+        <div class="label">Room correction</div>
+        <div class="hint" id="convhint">—</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="conv" disabled>
+        <span class="track"></span>
+      </label>
+    </div>
+  </section>
+
+  <section>
+    <h2>Bluetooth</h2>
+    <div class="row">
+      <div class="grow">
+        <div class="label">Discoverable</div>
+        <div class="hint" id="dischint">—</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="disc" disabled>
+        <span class="track"></span>
+      </label>
+    </div>
+  </section>
+
+  <section>
+    <h2>Clients</h2>
+    <div id="clients"><div class="empty">loading…</div></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+'use strict';
+
+// A token may be handed over once in the URL; keep it for the session and drop
+// it from the address bar so it does not sit in history or get shared by copy.
+const params = new URLSearchParams(location.search);
+if (params.has('token')) {
+  sessionStorage.setItem('ldacToken', params.get('token'));
+  history.replaceState(null, '', location.pathname);
+}
+const TOKEN = sessionStorage.getItem('ldacToken') || '';
+
+const $ = (id) => document.getElementById(id);
+let busy = false;      // an action is in flight; hold off refreshing over it
+let timer = null;
+
+function toast(message, isError) {
+  const el = $('toast');
+  el.textContent = message;
+  el.className = 'show' + (isError ? ' err' : '');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { el.className = ''; }, isError ? 6000 : 3000);
+}
+
+async function api(path, options = {}) {
+  const headers = { 'content-type': 'application/json' };
+  if (TOKEN) headers['x-auth-token'] = TOKEN;
+  const res = await fetch(path, { ...options, headers });
+  const data = await res.json().catch(() => ({ error: 'bad response' }));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function badge(text, kind) {
+  return `<span class="badge b-${kind}">${text}</span>`;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function renderFacts(s) {
+  const stream = s.stream || {};
+  const card = s.card || {};
+  const facts = [];
+
+  if (stream.connected) {
+    facts.push(['Codec', stream.codec || '—']);
+    facts.push(['Stream rate', stream.rate ? (stream.rate / 1000) + ' kHz' : '—']);
+    facts.push(['State', stream.running ? 'playing' : 'idle']);
+  } else {
+    facts.push(['Bluetooth', 'nothing connected']);
+  }
+  facts.push(['Output', card.open
+    ? `${card.format || '?'} · ${card.channels || '?'}ch`
+    : 'idle']);
+  facts.push(['Output rate', card.open && card.rate ? (card.rate / 1000) + ' kHz' : '—']);
+
+  $('facts').innerHTML = facts.map(([k, v]) =>
+    `<div class="fact"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`
+  ).join('');
+}
+
+function renderClients(devices) {
+  const box = $('clients');
+  if (!devices || !devices.length) {
+    box.innerHTML = '<div class="empty">No paired clients yet. ' +
+      'Turn on Discoverable and pair from the sending device.</div>';
+    return;
+  }
+  box.innerHTML = devices.map((d) => {
+    const badges = [
+      d.connected ? badge('connected', 'good') : badge('offline', 'warn'),
+      d.trusted ? badge('trusted', 'good') : badge('untrusted', 'warn'),
+      d.blocked ? badge('blocked', 'bad') : '',
+    ].join(' ');
+    const mac = esc(d.mac);
+    return `
+      <div class="client">
+        <div class="row" style="border:0;padding:0;margin:0">
+          <div class="grow">
+            <div class="name">${esc(d.name)} ${badges}</div>
+            <div class="mac">${mac}</div>
+          </div>
+          <div class="actions">
+            ${d.connected
+              ? `<button data-act="disconnect" data-mac="${mac}">Disconnect</button>`
+              : `<button data-act="connect" data-mac="${mac}">Connect</button>`}
+            ${d.trusted
+              ? `<button data-act="untrust" data-mac="${mac}">Untrust</button>`
+              : `<button data-act="trust" data-mac="${mac}">Trust</button>`}
+            <button class="danger" data-act="remove" data-mac="${mac}">Remove</button>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function render(s) {
+  const a = s.adapter || {};
+  $('devname').textContent = a.name || 'LDAC Receiver';
+  $('devsub').textContent = [a.address, a.powered ? 'powered' : 'off']
+    .filter(Boolean).join(' · ');
+
+  const c = s.convolution || {};
+  $('conv').checked = !!c.enabled;
+  $('conv').disabled = busy;
+  $('convhint').textContent = c.enabled
+    ? `${c.filter || 'convolution'} · ${c.running
+        ? `CamillaDSP running, ${c.cpu ?? '?'}% of a core`
+        : 'starts with playback'}`
+    : 'Bypassed — audio goes straight to the interface';
+
+  $('disc').checked = !!a.discoverable;
+  $('disc').disabled = busy;
+  $('dischint').textContent = a.discoverable
+    ? 'Visible to nearby devices, and accepting new pairings'
+    : 'Hidden. Already-paired clients can still connect.';
+
+  renderFacts(s);
+  renderClients(s.devices);
+}
+
+async function refresh() {
+  if (busy) return;
+  try {
+    render(await api('/api/status'));
+  } catch (err) {
+    $('devsub').textContent = 'lost contact with the receiver';
+    toast(err.message, true);
+  }
+}
+
+async function act(fn, message) {
+  busy = true;
+  document.querySelectorAll('button, input[type=checkbox]').forEach((el) => (el.disabled = true));
+  try {
+    const result = await fn();
+    if (result && result.ok === false) {
+      toast(result.message || result.error || 'that did not work', true);
+    } else if (message) {
+      toast(message);
+    }
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    busy = false;
+    await refresh();
+  }
+}
+
+$('conv').addEventListener('change', (e) => {
+  const on = e.target.checked;
+  act(() => api('/api/convolution', {
+    method: 'POST', body: JSON.stringify({ enabled: on }),
+  }), on ? 'Room correction on — playback restarted'
+         : 'Room correction bypassed — playback restarted');
+});
+
+$('disc').addEventListener('change', (e) => {
+  const on = e.target.checked;
+  act(() => api('/api/discoverable', {
+    method: 'POST', body: JSON.stringify({ enabled: on }),
+  }), on ? 'Discoverable' : 'Hidden');
+});
+
+$('clients').addEventListener('click', (e) => {
+  const button = e.target.closest('button[data-act]');
+  if (!button) return;
+  const { act: action, mac } = button.dataset;
+  if (action === 'remove' &&
+      !confirm(`Remove ${mac}?\n\nThe pairing is deleted; the device has to pair again.`)) {
+    return;
+  }
+  act(() => api('/api/device', {
+    method: 'POST', body: JSON.stringify({ action, mac }),
+  }), null);
+});
+
+// Poll, but not while the tab is hidden — this box is often left open.
+function schedule() {
+  clearInterval(timer);
+  timer = setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+refresh();
+schedule();
+</script>
+</body>
+</html>

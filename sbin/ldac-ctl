@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Privileged control surface for the LDAC receiver.
+
+This is the trust boundary between the web control panel and the system.  The
+panel runs unprivileged and may only run *this* script through sudo, so every
+privileged action the panel can perform is one of the verbs below, with its
+arguments validated here.  Nothing takes a free-form command, a path, or a shell
+string, and no subprocess is ever run through a shell.
+
+Verbs:
+    status                      everything the panel displays, as JSON
+    convolution on|off          route Bluetooth audio through CamillaDSP or not
+    discoverable on|off         adapter visibility, persisted across reboots
+    device connect|disconnect|trust|untrust|remove MAC
+    apply-boot                  restore the persisted state at boot
+
+SPDX-License-Identifier: MIT
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+DEFAULTS = "/etc/default/ldac-receiver"
+BLUETOOTH_STATE = "/var/lib/bluetooth"
+CARD = os.environ.get("LDAC_CARD", "U192k")
+CDSP_CONFIG = "/etc/camilladsp/roomcorr.yaml"
+
+# The PCM names defined in /etc/asound.conf.  `dsp96` runs through CamillaDSP,
+# `ldac96` goes straight to the card.
+PCM_DSP = "dsp96"
+PCM_DIRECT = "ldac96"
+
+MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+SERVICES = ("bluetooth", "bluealsa", "bluealsa-aplay", "bt-agent", "ldac-web")
+
+
+def run(argv, timeout=15):
+    """Run a command with no shell, returning (rc, stdout). Never raises."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.SubprocessError):
+        return -1, ""
+
+
+def read_defaults():
+    values = {}
+    try:
+        with open(DEFAULTS) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip().strip('"')
+    except OSError:
+        pass
+    return values
+
+
+def write_defaults(updates):
+    """Rewrite the defaults file, preserving comments and key order."""
+    lines, seen = [], set()
+    try:
+        with open(DEFAULTS) as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    key = stripped.split("=", 1)[0].strip()
+                    if key in updates:
+                        lines.append("%s=%s\n" % (key, updates[key]))
+                        seen.add(key)
+                        continue
+                lines.append(line)
+    except OSError:
+        pass
+    for key, value in updates.items():
+        if key not in seen:
+            lines.append("%s=%s\n" % (key, value))
+
+    # Atomic replace: a half-written defaults file would take the audio path
+    # down on the next restart.
+    directory = os.path.dirname(DEFAULTS)
+    fd, tmp = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.writelines(lines)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, DEFAULTS)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def adapter_path():
+    try:
+        for name in sorted(os.listdir(BLUETOOTH_STATE)):
+            if MAC_RE.match(name.upper()):
+                return os.path.join(BLUETOOTH_STATE, name)
+    except OSError:
+        pass
+    return None
+
+
+def connected_macs():
+    """Active ACL links, from a single hcitool call."""
+    _, out = run(["hcitool", "con"])
+    return {m.upper() for m in re.findall(r"ACL ((?:[0-9A-F]{2}:){5}[0-9A-F]{2})",
+                                          out, re.I)}
+
+
+def paired_devices():
+    """Bonded devices, read from BlueZ's own state directory.
+
+    Cheaper and more reliable than asking bluetoothctl device by device: a
+    directory with an `info` file is exactly a stored bond.
+    """
+    base = adapter_path()
+    if base is None:
+        return []
+    live = connected_macs()
+    devices = []
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError:
+        return []
+    for name in entries:
+        mac = name.upper()
+        if not MAC_RE.match(mac):
+            continue
+        info = os.path.join(base, name, "info")
+        if not os.path.exists(info):
+            continue          # cache entry, never bonded
+        friendly, trusted, blocked, klass = mac, False, False, None
+        try:
+            with open(info, errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("Name="):
+                        friendly = line[5:]
+                    elif line.startswith("Trusted="):
+                        trusted = line[8:].lower() == "true"
+                    elif line.startswith("Blocked="):
+                        blocked = line[8:].lower() == "true"
+                    elif line.startswith("Class="):
+                        klass = line[6:]
+        except OSError:
+            pass
+        devices.append({
+            "mac": mac,
+            "name": friendly,
+            "trusted": trusted,
+            "blocked": blocked,
+            "class": klass,
+            "connected": mac in live,
+        })
+    return devices
+
+
+def adapter_state():
+    _, out = run(["btmgmt", "info"])
+    settings = ""
+    for line in out.splitlines():
+        if "current settings:" in line:
+            settings = line.split("current settings:", 1)[1]
+            break
+    addr = re.search(r"addr ((?:[0-9A-F]{2}:){5}[0-9A-F]{2})", out, re.I)
+    name = re.search(r"^\s*name (.+)$", out, re.M)
+    flags = settings.split()
+    return {
+        "address": addr.group(1).upper() if addr else None,
+        "name": name.group(1).strip() if name else None,
+        "powered": "powered" in flags,
+        "discoverable": "discoverable" in flags,
+        "bondable": "bondable" in flags,
+        "connectable": "connectable" in flags,
+    }
+
+
+def stream_state():
+    """The A2DP stream BlueALSA currently has, if any."""
+    rc, out = run(["bluealsactl", "list-pcms"])
+    path = next((p for p in out.split() if p.startswith("/org/bluealsa/")), None)
+    if rc != 0 or path is None:
+        return {"connected": False}
+    _, info = run(["bluealsactl", "info", path])
+    fields = {}
+    for line in info.splitlines():
+        key, _, value = line.partition(":")
+        if value:
+            fields[key.strip().lower()] = value.strip()
+    rate = re.match(r"(\d+)", fields.get("rate", ""))
+    return {
+        "connected": True,
+        "codec": fields.get("selected codec"),
+        "available": (fields.get("available codecs") or "").split(),
+        "rate": int(rate.group(1)) if rate else None,
+        "format": fields.get("format"),
+        "channels": fields.get("channels"),
+        "running": fields.get("running", "").lower() == "true",
+    }
+
+
+def card_state():
+    """What the sound card is really doing, straight from ALSA.
+
+    /proc/asound has a symlink named after the card id pointing at cardN, so the
+    id can be used as a path component directly.
+    """
+    params = "/proc/asound/%s/pcm0p/sub0/hw_params" % CARD
+    try:
+        with open(params) as fh:
+            text = fh.read()
+    except OSError:
+        return {"open": False, "error": "card %s not found" % CARD}
+    if "closed" in text:
+        return {"open": False}
+    out = {"open": True}
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key == "rate":
+            out["rate"] = int(value.split()[0])
+        elif key in ("format", "channels"):
+            out[key] = value
+    return out
+
+
+def camilladsp_state():
+    rc, out = run(["pgrep", "-a", "camilladsp"])
+    if rc != 0 or not out.strip():
+        return {"running": False}
+    pid = out.split()[0]
+    _, cpu = run(["ps", "-o", "pcpu=", "-p", pid])
+    try:
+        load = float(cpu.strip())
+    except ValueError:
+        load = None
+    return {"running": True, "pid": int(pid), "cpu": load}
+
+
+def convolution_state():
+    pcm = read_defaults().get("LDAC_PCM", PCM_DSP)
+    state = {"enabled": pcm == PCM_DSP, "pcm": pcm}
+    # Name the filter actually configured, rather than assuming.
+    try:
+        with open(CDSP_CONFIG) as fh:
+            found = re.findall(r"filename:\s*(\S+)", fh.read())
+        if found:
+            state["filter"] = os.path.basename(found[0].strip('"\''))
+    except OSError:
+        pass
+    state.update(camilladsp_state())
+    return state
+
+
+def services_state():
+    out = {}
+    for unit in SERVICES:
+        rc, text = run(["systemctl", "is-active", unit])
+        out[unit] = text.strip() or "unknown"
+    return out
+
+
+def cmd_status():
+    return {
+        "convolution": convolution_state(),
+        "adapter": adapter_state(),
+        "stream": stream_state(),
+        "card": card_state(),
+        "services": services_state(),
+        "devices": paired_devices(),
+    }
+
+
+def want_on(word):
+    if word not in ("on", "off"):
+        fail("expected 'on' or 'off', got %r" % word)
+    return word == "on"
+
+
+def cmd_convolution(word):
+    on = want_on(word)
+    write_defaults({"LDAC_PCM": PCM_DSP if on else PCM_DIRECT})
+    # bluealsa-aplay picks the PCM up from the defaults file at start, so the
+    # change takes effect on restart.  This interrupts anything playing.
+    rc, _ = run(["systemctl", "restart", "bluealsa-aplay"], timeout=30)
+    if rc != 0:
+        fail("could not restart bluealsa-aplay")
+    return {"ok": True, "convolution": convolution_state()}
+
+
+def cmd_discoverable(word):
+    on = want_on(word)
+    write_defaults({"LDAC_DISCOVERABLE": "on" if on else "off"})
+    rc, _ = run(["btmgmt", "discov", "on" if on else "off"])
+    if rc != 0:
+        fail("btmgmt discov failed")
+    return {"ok": True, "adapter": adapter_state()}
+
+
+def cmd_device(action, mac):
+    mac = mac.upper()
+    if not MAC_RE.match(mac):
+        fail("not a Bluetooth address: %r" % mac)
+    # bluetoothctl exits 0 even when the operation failed, so each action is
+    # judged on what it printed rather than on the exit status.
+    success_marker = {
+        "connect": ("connection successful", "already connected"),
+        "disconnect": ("successful disconnected", "not connected"),
+        "trust": ("trust succeeded",),
+        "untrust": ("untrust succeeded",),
+        "remove": ("has been removed",),
+    }
+    if action not in success_marker:
+        fail("unknown device action: %r" % action)
+    # `connect` can sit for a while on this adapter, and often needs a retry.
+    rc, out = run(["bluetoothctl", action, mac],
+                  timeout=45 if action == "connect" else 20)
+    lowered = out.lower()
+    ok = rc != -1 and any(m in lowered for m in success_marker[action])
+    last = [ln for ln in out.strip().splitlines() if ln.strip()]
+    return {"ok": ok, "message": last[-1] if last else "",
+            "devices": paired_devices()}
+
+
+def cmd_apply_boot():
+    """Put the adapter into the state the panel last asked for."""
+    values = read_defaults()
+    run(["btmgmt", "power", "on"])
+    run(["btmgmt", "connectable", "on"])
+    run(["btmgmt", "bondable", "on"])
+    discoverable = values.get("LDAC_DISCOVERABLE", "on")
+    run(["btmgmt", "discov", "on" if discoverable == "on" else "off"])
+    return {"ok": True, "adapter": adapter_state()}
+
+
+def fail(message):
+    json.dump({"ok": False, "error": message}, sys.stdout)
+    sys.stdout.write("\n")
+    sys.exit(2)
+
+
+def main(argv):
+    if not argv:
+        fail("no verb given")
+    verb, args = argv[0], argv[1:]
+    if verb == "status" and not args:
+        result = cmd_status()
+    elif verb == "convolution" and len(args) == 1:
+        result = cmd_convolution(args[0])
+    elif verb == "discoverable" and len(args) == 1:
+        result = cmd_discoverable(args[0])
+    elif verb == "device" and len(args) == 2:
+        result = cmd_device(args[0], args[1])
+    elif verb == "apply-boot" and not args:
+        result = cmd_apply_boot()
+    else:
+        fail("unknown verb or wrong number of arguments: %r" % (argv,))
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

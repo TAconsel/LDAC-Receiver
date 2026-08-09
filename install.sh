@@ -36,6 +36,13 @@ ALSA_CDSP_REPO="https://github.com/scripple/alsa_cdsp.git"
 # v4 needs glibc 2.34; bullseye has 2.31. v3.0.1 is the newest that runs here.
 CAMILLADSP_VERSION="${CAMILLADSP_VERSION:-v3.0.1}"
 
+# Control panel.  bullseye only has Node 12, which is long out of support, so a
+# current LTS is installed alongside it the same way as CamillaDSP.
+NODE_VERSION="${NODE_VERSION:-v24.19.0}"
+WEB_USER=ldacweb
+WEB_DIR=/usr/local/share/ldac-web
+DEFAULTS=/etc/default/ldac-receiver
+
 PREFIX=/usr/local
 DEC_INCLUDEDIR="$PREFIX/include/ldac-dec"
 
@@ -57,14 +64,21 @@ esac
 if [[ $MODE == uninstall ]]; then
 	say "Stopping and disabling services"
 	sudo systemctl disable --now bluealsa-aplay.service bluealsa.service \
-		bt-agent.service bluetooth-sink-setup.service 2>/dev/null || true
+		bt-agent.service bluetooth-sink-setup.service ldac-web.service \
+		2>/dev/null || true
+
+	say "Removing the control panel"
+	sudo rm -rf "$WEB_DIR" /etc/sudoers.d/ldac-web /usr/local/sbin/ldac-ctl \
+		"$DEFAULTS"
+	id -u "$WEB_USER" >/dev/null 2>&1 && sudo userdel "$WEB_USER" || true
 
 	say "Removing configuration"
 	sudo rm -rf /etc/systemd/system/bluealsa.service.d \
 		/etc/systemd/system/bluealsa-aplay.service.d \
 		/etc/systemd/system/bluetooth.service.d/override.conf \
 		/etc/systemd/system/bt-agent.service \
-		/etc/systemd/system/bluetooth-sink-setup.service
+		/etc/systemd/system/bluetooth-sink-setup.service \
+		/etc/systemd/system/ldac-web.service
 	sudo rm -f /etc/asound.conf
 	# Back to the distribution bluetoothd.
 	sudo rm -f /usr/local/libexec/bluetooth/bluetoothd
@@ -224,6 +238,50 @@ camilladsp -c "$CDSP_DIR/roomcorr.yaml" >/dev/null 2>&1 ||
 	die "CamillaDSP rejected $CDSP_DIR/roomcorr.yaml; run
        'camilladsp -c $CDSP_DIR/roomcorr.yaml' to see why"
 
+# --- control panel ----------------------------------------------------------
+say "Installing Node $NODE_VERSION"
+if ! command -v node >/dev/null || [[ $(node --version 2>/dev/null) != "$NODE_VERSION" ]]; then
+	tmp=$(mktemp -d)
+	curl -fsSL -o "$tmp/node.tar.xz" \
+		"https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-linux-arm64.tar.xz" ||
+		die "couldn't download Node $NODE_VERSION"
+	tar xf "$tmp/node.tar.xz" -C "$tmp"
+	# The panel has no dependencies and never needs npm, so only the runtime
+	# is installed.
+	sudo install -m 0755 "$tmp/node-$NODE_VERSION-linux-arm64/bin/node" /usr/local/bin/node
+	rm -rf "$tmp"
+fi
+node --version >/dev/null 2>&1 || die "the Node binary will not run here"
+
+say "Installing the control panel"
+# A system account with no home and no shell: it only ever runs the panel.
+id -u "$WEB_USER" >/dev/null 2>&1 ||
+	sudo useradd --system --no-create-home --home-dir /nonexistent \
+		--shell /usr/sbin/nologin "$WEB_USER"
+
+# The privileged half.  Must stay root-owned and not writable by the panel's
+# user, since sudo lets that user run it as root.
+sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-ctl" /usr/local/sbin/ldac-ctl
+
+sudo install -d "$WEB_DIR/public"
+sudo install -m 0644 "$HERE/web/server.js" "$WEB_DIR/server.js"
+sudo install -m 0644 "$HERE/web/public/index.html" "$WEB_DIR/public/index.html"
+
+# visudo -c on a copy first: a malformed sudoers file can lock the machine out
+# of sudo entirely.
+tmp_sudoers=$(mktemp)
+cp "$HERE/config/sudoers-ldac-web" "$tmp_sudoers"
+sudo visudo -cqf "$tmp_sudoers" || { rm -f "$tmp_sudoers"; die "sudoers snippet is invalid"; }
+sudo install -m 0440 -o root -g root "$tmp_sudoers" /etc/sudoers.d/ldac-web
+rm -f "$tmp_sudoers"
+
+# Runtime state.  Never overwritten: it holds the choices made in the panel.
+if [[ -f $DEFAULTS ]]; then
+	echo "keeping existing $DEFAULTS"
+else
+	sudo install -m 0644 "$HERE/config/ldac-receiver.defaults" "$DEFAULTS"
+fi
+
 # PulseAudio registers its own A2DP endpoints with BlueZ and would compete with
 # BlueALSA for them, and would also hold the sound card.  This box is a headless
 # appliance, so it is masked rather than reconfigured.
@@ -259,19 +317,20 @@ sudo install -m 0644 "$HERE/config/bluealsa-aplay.service.d-override.conf" \
 sudo install -m 0644 "$HERE/config/bluetooth.service.d-override.conf" \
 	/etc/systemd/system/bluetooth.service.d/override.conf
 sudo install -m 0644 "$HERE/config/bt-agent.service" \
-	"$HERE/config/bluetooth-sink-setup.service" /etc/systemd/system/
+	"$HERE/config/bluetooth-sink-setup.service" \
+	"$HERE/config/ldac-web.service" /etc/systemd/system/
 
 sudo systemctl daemon-reload
 sudo systemctl restart bluetooth.service
 sudo systemctl enable --now bluetooth-sink-setup.service bt-agent.service \
-	bluealsa.service bluealsa-aplay.service
-sudo systemctl restart bluealsa.service bluealsa-aplay.service
+	bluealsa.service bluealsa-aplay.service ldac-web.service
+sudo systemctl restart bluealsa.service bluealsa-aplay.service ldac-web.service
 
 # --- verify -----------------------------------------------------------------
 say "Verifying"
 sleep 2
 fail=0
-for u in bluetooth bluealsa bluealsa-aplay bt-agent; do
+for u in bluetooth bluealsa bluealsa-aplay bt-agent ldac-web; do
 	if systemctl is-active --quiet "$u"; then
 		printf '  %-22s active\n' "$u"
 	else
@@ -294,4 +353,9 @@ Ready.  Pair from the sending device — this box is discoverable as
 "$(hostname)".  Then check what it negotiated with:
 
     tools/ldac-status.sh
+
+Control panel: http://$(hostname -I | awk '{print $1}'):8080/
+  room correction on/off, discoverable on/off, and paired clients.
+  It has no password; see "Control panel" in README.md if that is not what
+  you want on your network.
 EOF

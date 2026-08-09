@@ -1,25 +1,23 @@
 # Installed as /etc/systemd/system/bluetooth-sink-setup.service
 #
-# BlueZ powers the adapter up from main.conf, but "discoverable" and "pairable"
-# are runtime properties set over D-Bus, not settings in main.conf, and BlueZ
-# 5.55 has no option to make them stick across a restart.  This puts them back
-# after bluetoothd starts so the box can always be found and paired with.
+# BlueZ powers the adapter up from main.conf, but "discoverable", "connectable"
+# and "bondable" are runtime properties set over D-Bus or the management socket,
+# not settings in main.conf, and BlueZ 5.55 has no option to make them stick
+# across a restart.  This puts them back after bluetoothd starts, using the
+# discoverable state the web panel last saved in /etc/default/ldac-receiver.
 #
-# btmgmt talks to the kernel's management socket directly, which works headless;
-# bluetoothctl would need an interactive session.
+# ldac-ctl talks to the kernel's management socket via btmgmt, which works
+# headless; bluetoothctl would need an interactive session.
 
 [Unit]
-Description=Make the Bluetooth adapter discoverable and pairable (A2DP sink)
+Description=Restore Bluetooth adapter state for the A2DP sink
 After=bluetooth.service
 Requires=bluetooth.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/btmgmt power on
-ExecStart=/usr/bin/btmgmt connectable on
-ExecStart=/usr/bin/btmgmt bondable on
-ExecStart=/usr/bin/btmgmt discov on
+ExecStart=/usr/local/sbin/ldac-ctl apply-boot
 
 [Install]
 WantedBy=bluetooth.target
