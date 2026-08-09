@@ -133,7 +133,16 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === '/api/volume') {
-    // Mute and level are separate requests; a body with both is ambiguous.
+    // Source, mute and level are separate requests; a body with several would
+    // be ambiguous about which one was meant.
+    if ('source' in body) {
+      if (body.source !== 'panel' && body.source !== 'device') {
+        return sendJson(res, 400, {
+          ok: false, error: '"source" must be "panel" or "device"',
+        });
+      }
+      return sendJson(res, 200, await ctl(['volume', 'source', body.source]));
+    }
     if ('muted' in body) {
       const state = onOff(body.muted);
       if (state === null) {

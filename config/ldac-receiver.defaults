@@ -14,3 +14,11 @@ LDAC_PCM=dsp96
 # it; leaving it off makes the box invisible to devices that are not already
 # bonded.
 LDAC_DISCOVERABLE=on
+
+# Who drives the audio interface's own volume control:
+#   software - the control panel's slider owns it, and the connected device's
+#              volume is applied digitally instead (default)
+#   mixer    - the connected device's volume sets the interface level directly.
+#              Nothing then scales the samples anywhere, but the device will
+#              overwrite whatever the slider was set to.
+LDAC_VOLUME_MODE=software

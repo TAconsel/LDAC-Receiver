@@ -13,6 +13,7 @@ Verbs:
     discoverable on|off         adapter visibility, persisted across reboots
     volume set DB               interface output level, in dB (<= 0)
     volume mute on|off          interface output mute
+    volume source panel|device  who drives the interface's volume control
     device connect|disconnect|trust|untrust|remove MAC
     apply-boot                  restore the persisted state at boot
 
@@ -47,6 +48,12 @@ MIXER_CONTROL = os.environ.get("LDAC_MIXER_CONTROL", "UMC404HD 192k Output")
 # How far down the panel's slider goes.  Everything below is inaudible anyway,
 # and mute is a separate button.
 VOLUME_FLOOR_DB = -80.0
+
+# Who drives that control, as bluealsa-aplay's --volume argument.  "mixer" hands
+# it to the connected device; "software" keeps it for the panel and applies the
+# device's volume digitally instead.
+VOLUME_MODE_PANEL = "software"
+VOLUME_MODE_DEVICE = "mixer"
 
 
 def run(argv, timeout=15):
@@ -250,14 +257,18 @@ def volume_state():
     Read from the first playback channel; the element covers all four outputs
     and they are always set together.
     """
+    mode = read_defaults().get("LDAC_VOLUME_MODE", VOLUME_MODE_PANEL)
+    source = "device" if mode == VOLUME_MODE_DEVICE else "panel"
+
     rc, out = run(["amixer", "-c", CARD, "sget", MIXER_CONTROL])
     if rc != 0:
-        return {"available": False, "error": "no '%s' control on card %s"
-                                             % (MIXER_CONTROL, CARD)}
+        return {"available": False, "source": source,
+                "error": "no '%s' control on card %s" % (MIXER_CONTROL, CARD)}
     m = re.search(r"Playback (\d+) \[(\d+)%\] \[(-?[\d.]+)dB\] \[(on|off)\]", out)
     if not m:
         # Some controls have no dB scale; without one a dB slider is meaningless.
-        return {"available": False, "error": "control has no dB scale"}
+        return {"available": False, "source": source,
+                "error": "control has no dB scale"}
     return {
         "available": True,
         "control": MIXER_CONTROL,
@@ -266,6 +277,7 @@ def volume_state():
         "db": float(m.group(3)),
         "muted": m.group(4) == "off",
         "floor_db": VOLUME_FLOOR_DB,
+        "source": source,
     }
 
 
@@ -295,6 +307,18 @@ def store_mixer():
 
 
 def cmd_volume(action, value):
+    if action == "source":
+        if value not in ("panel", "device"):
+            fail("volume source must be 'panel' or 'device', got %r" % value)
+        write_defaults({"LDAC_VOLUME_MODE": VOLUME_MODE_DEVICE if value == "device"
+                        else VOLUME_MODE_PANEL})
+        # bluealsa-aplay reads --volume once at start, so the change lands on
+        # restart.  This interrupts anything playing, as with the DSP toggle.
+        rc, _ = run(["systemctl", "restart", "bluealsa-aplay"], timeout=30)
+        if rc != 0:
+            fail("could not restart bluealsa-aplay")
+        return {"ok": True, "volume": volume_state()}
+
     if action == "mute":
         on = want_on(value)
         rc, _ = run(["amixer", "-c", CARD, "-q", "sset", MIXER_CONTROL,

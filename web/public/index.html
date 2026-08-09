@@ -176,6 +176,16 @@
     <input type="range" id="vol" min="-80" max="0" step="1" value="0" disabled
            aria-label="Output level in decibels">
     <div class="scale"><span id="volmin">−80 dB</span><span>0 dB</span></div>
+    <div class="row">
+      <div class="grow">
+        <div class="label">Let the connected device set this</div>
+        <div class="hint" id="srchint">—</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="volsrc" disabled>
+        <span class="track"></span>
+      </label>
+    </div>
   </section>
 
   <section>
@@ -352,9 +362,28 @@ $('mute').addEventListener('click', () => {
   }), null);
 });
 
+$('volsrc').addEventListener('change', (e) => {
+  const toDevice = e.target.checked;
+  act(() => api('/api/volume', {
+    method: 'POST', body: JSON.stringify({ source: toDevice ? 'device' : 'panel' }),
+  }), toDevice ? 'The connected device now sets the output level'
+               : 'The slider now owns the output level');
+});
+
 function renderVolume(v) {
   const slider = $('vol');
   const mute = $('mute');
+  const src = $('volsrc');
+
+  const byDevice = v && v.source === 'device';
+  src.checked = !!byDevice;
+  src.disabled = busy || !v;
+  $('srchint').textContent = byDevice
+    ? 'Its volume drives the interface directly, so nothing scales the audio — '
+      + 'but it overwrites the slider whenever it changes.'
+    : 'The slider owns the interface level; the device\'s volume is applied '
+      + 'digitally instead, so the two never fight.';
+
   if (!v || !v.available) {
     slider.disabled = true;
     mute.disabled = true;

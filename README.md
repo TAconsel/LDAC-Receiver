@@ -177,19 +177,27 @@ calibrated **in dB, not percent**, because that control is 128 steps of exactly
 1 dB from 0 down to −127 dB: a percentage slider would put half its travel below
 −63 dB, which is silence. It runs 0 to −80 dB, with mute as a separate button.
 
-Two volume controls with separate jobs, which is why `bluealsa-aplay` runs with
-`--volume=software` rather than the more obvious `--volume=mixer`:
+**Who owns that level** is a switch — *Let the connected device set this* —
+because there is a real trade-off either way. It flips `bluealsa-aplay` between
+`--volume=software` and `--volume=mixer` and restarts it.
 
-| | |
-| --- | --- |
-| the sender's volume | applied digitally, before the DSP |
-| this slider | the interface's analogue output level |
+| | the slider owns it (default) | the device owns it |
+| --- | --- | --- |
+| interface level | set here, stays put | follows the device's volume |
+| device's volume | applied digitally, before the DSP | drives the interface directly |
+| scaling the samples | yes, on the sender's volume | none anywhere in the path |
+| the catch | a digital gain stage, however small | the device overwrites the slider |
 
-In `--volume=mixer` the daemon writes that same mixer whenever the remote
-changes volume, so the slider snaps back under your finger while a device is
-connected — verified, and the reason for the change. For bit-perfect output,
-leave the sender at 100% and set the level here: nothing then scales the samples
-anywhere in the path.
+Leave it off and the two controls never fight, which is what makes the slider
+usable: in mixer mode the daemon rewrites that mixer on every remote volume
+change, so the slider snaps back under your finger while a device is connected.
+Turn it on if you want the phone's volume keys to work the way they would on a
+Bluetooth speaker, with nothing touching the audio on the way through — verified
+end to end, a device volume of 127/96/64/40 lands on 0/−4/−10/−17 dB at the
+interface.
+
+For output that is bit-perfect all the way to the converter either way, leave
+the sender at 100% and set the level with the slider.
 
 **Read this before putting it on your network: there is no password by
 default.** Anyone who can reach the port can unpair your devices and toggle the
@@ -226,6 +234,7 @@ sudo ldac-ctl status                     # everything, as JSON
 sudo ldac-ctl convolution off            # bypass room correction
 sudo ldac-ctl volume set -18             # output level, in dB
 sudo ldac-ctl volume mute on
+sudo ldac-ctl volume source device       # hand the level to the connected device
 sudo ldac-ctl discoverable off           # hide the adapter
 sudo ldac-ctl device remove AA:BB:CC:DD:EE:FF
 ```
@@ -248,7 +257,7 @@ card exclusively, so the path cannot be swapped underneath a running stream.
 | `GET /api/status` | everything the page shows |
 | `POST /api/convolution` | `{"enabled": true\|false}` |
 | `POST /api/discoverable` | `{"enabled": true\|false}` |
-| `POST /api/volume` | `{"db": -18}` or `{"muted": true\|false}` |
+| `POST /api/volume` | `{"db": -18}`, `{"muted": true\|false}` or `{"source": "panel"\|"device"}` |
 | `POST /api/device` | `{"action": "connect\|disconnect\|trust\|untrust\|remove", "mac": "…"}` |
 
 **systemd sandboxing note.** `ldac-web.service` looks under-hardened on purpose.
