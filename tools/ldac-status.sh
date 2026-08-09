@@ -60,6 +60,22 @@ fi
 journalctl -u bluealsa -b --no-pager 2>/dev/null |
 	sed -n 's/.*\(Media transport socket MTU.*\)/  \1/p' | tail -1
 
+hdr "room correction"
+# CamillaDSP is started by the alsa_cdsp plugin when BlueALSA opens the device,
+# so it only runs while something is playing.
+if cdsp=$(pgrep -a camilladsp | head -1); then
+	echo "  running: ${cdsp#* }" | fold -s -w 100 | sed '2,$s/^/           /'
+	printf '  cpu: %s%% of one core\n' "$(ps -o pcpu= -p "${cdsp%% *}" | tr -d ' ')"
+else
+	echo "  not running (starts with playback)"
+	pcm=$(sed -n 's/^ *--pcm=\([^ ]*\).*/\1/p' \
+		/etc/systemd/system/bluealsa-aplay.service.d/override.conf 2>/dev/null |
+		tail -1)
+	grep -q -- '--pcm=dsp96' /etc/systemd/system/bluealsa-aplay.service.d/override.conf 2>/dev/null &&
+		echo "  configured: bluealsa-aplay plays into dsp96 (correction on)" ||
+		echo "  !! bluealsa-aplay is not using dsp96 — correction is bypassed${pcm:+ (--pcm=$pcm)}"
+fi
+
 hdr "sound card"
 hw=$(echo /proc/asound/card*/pcm0p/sub0/hw_params)
 for f in $hw; do

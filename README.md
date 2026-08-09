@@ -1,15 +1,16 @@
 # Bluetooth LDAC receiver for the Radxa Cubie A7S
 
-Turns the board into an A2DP **sink** that accepts LDAC and plays it out of a USB
-audio interface at **24-bit / 96 kHz**.
+Turns the board into an A2DP **sink** that accepts LDAC, applies FIR room
+correction, and plays the result out of a USB audio interface at
+**24-bit / 96 kHz**.
 
 Verified on a Radxa Cubie A7S (Allwinner A733, Debian 11 bullseye, aarch64,
 BlueZ 5.55, AIC8800D80 Bluetooth) with a Behringer UMC404HD, receiving from a
 PipeWire 1.6.2 sender.
 
 ```
-sender ──LDAC/A2DP──▶ bluealsad ──▶ libldacBT_dec ──▶ ALSA "ldac96" ──▶ UMC404HD
-                      (A2DP sink)   (libldacdec)      plug + route      24-bit/96 kHz
+sender ──LDAC/A2DP──▶ bluealsad ──▶ libldacBT_dec ──▶ ALSA "dsp96" ──▶ CamillaDSP ──▶ UMC404HD
+                      (A2DP sink)   (libldacdec)      alsa_cdsp        convolution    24-bit/96 kHz
 ```
 
 ## Install
@@ -62,7 +63,10 @@ the service at the rebuilt one in `/usr/local/libexec`.
 | `/usr/local/lib/pkgconfig/ldacBT-dec.pc` | what BlueALSA's `configure` looks for |
 | `/usr/local/bin/bluealsad`, `bluealsa-aplay`, `bluealsactl` | BlueALSA |
 | `/usr/local/libexec/bluetooth/bluetoothd` | BlueZ with the AVDTP MTU fix |
-| `/etc/asound.conf` | the `ldac96` output PCM |
+| `/usr/local/bin/camilladsp` | CamillaDSP v3.0.1 |
+| `…/alsa-lib/libasound_module_pcm_cdsp.so` | the alsa_cdsp plugin |
+| `/etc/camilladsp/roomcorr.yaml`, `Test900.wav` | the DSP config and filter |
+| `/etc/asound.conf` | the `ldac96` and `dsp96` output PCMs |
 | `/etc/systemd/system/*.service.d/override.conf` | service arguments |
 | `/etc/systemd/system/bt-agent.service` | headless pairing agent |
 | `/etc/systemd/system/bluetooth-sink-setup.service` | discoverable + pairable at boot |
@@ -97,6 +101,66 @@ ttable.1.3 1
 samples. At full volume the decoded stream reaches the converter bit-perfect.
 For output that ignores the remote entirely, switch to `--volume=none` in
 `config/bluealsa-aplay.service.d-override.conf`.
+
+## Room correction
+
+`Test900.wav` holds one impulse response per channel — 32768 taps at 96 kHz
+(341 ms), float32. CamillaDSP convolves each channel with its own response and
+then widens the result to the card's four channels.
+
+**How the audio gets there.** This board's BSP kernel has no `snd-aloop`, so the
+usual ALSA-loopback route into CamillaDSP is not available. The
+[alsa_cdsp](https://github.com/scripple/alsa_cdsp) plugin is used instead: it
+presents itself to BlueALSA as an ALSA device (`dsp96`), starts CamillaDSP when
+that device is opened, and pipes audio to its stdin. CamillaDSP owns the sound
+card from there, so the 4-channel layout and the 96 kHz rate live in
+`/etc/camilladsp/roomcorr.yaml` rather than in `asound.conf`. Nothing
+kernel-side is involved, and CamillaDSP only runs while something is playing.
+
+The plugin passes the stream's format, rate and channel count to CamillaDSP as
+`-f/-r/-n/-e` rather than rewriting the config file, so the config can stay
+read-only — which matters because the plugin runs inside `bluealsa-aplay`'s
+systemd sandbox.
+
+**Only 96 kHz.** The filter is a 96 kHz impulse response and would be wrong at
+any other rate, so `dsp96` offers 96 kHz alone and a `plug` in front converts
+anything else up to it. A 44.1 kHz SBC stream is resampled to 96 kHz before
+correction.
+
+**Latency and cost.** The response peaks at ~45.5 ms, so it is a linear-phase
+correction and adds that much delay on top of Bluetooth's ~200 ms; fine for
+music, not for lip-sync. Convolution costs about 22% of one Cortex-A55 core —
+under 3% of the board.
+
+**Headroom.** This filter's maximum gain is −0.25 dB (left) and −1.15 dB
+(right), i.e. already normalised so it cannot clip, so no attenuation is
+applied. **If you replace it with one that boosts anywhere, add a `Gain` filter
+ahead of the convolution with a matching negative gain**, or the output will
+clip. `tools/verify-convolution.sh` prints nothing about this — check the filter
+itself.
+
+**Replacing the filter.** Drop in a new WAV (one channel per output, at 96 kHz)
+and re-run `./install.sh`, or point `IR=` at it:
+
+```sh
+IR=/path/to/new-correction.wav ./install.sh
+```
+
+**Bypassing it.** `ldac96` in `/etc/asound.conf` is the uncorrected path. Switch
+`--pcm=dsp96` to `--pcm=ldac96` in
+`/etc/systemd/system/bluealsa-aplay.service.d/override.conf` and restart the
+service. The two are alternatives — CamillaDSP opens the card exclusively.
+
+**Buffering.** `bluealsa-aplay` runs with a 500 ms buffer. The default 200 ms is
+too tight once CamillaDSP is in the path: the player feeds a pipe drained in
+chunks rather than a soundcard draining steadily, which produced a
+drain-to-avoid-underrun every few seconds. At 500 ms a 40-second stream logs a
+single priming event.
+
+**CamillaDSP version.** Pinned to v3.0.1. Releases from v4 onwards are built
+against glibc 2.34 and will not start on bullseye (glibc 2.31) — they fail at
+exec with `GLIBC_2.34 not found`. `install.sh` checks this and stops with an
+explanation.
 
 ## Pairing
 
@@ -147,6 +211,26 @@ the sound card is really running at. During an LDAC stream it should show:
     channels: 4
     rate: 96000 (96000/1)
 ```
+
+```sh
+tools/verify-convolution.sh
+```
+
+proves the room correction is actually applied, and applied correctly. An
+impulse convolved with a filter is that filter, so it pushes a unit impulse
+through the **installed** config — only the `devices:` block is swapped for file
+in / file out, everything below it is taken verbatim — and compares the result
+against the impulse response file tap by tap, then checks that outputs 3 and 4
+stay silent. It cannot pass while the live pipeline differs. Expect:
+
+```
+channel 0: 32768 taps compared, worst error 4.66e-10 ... -> ok
+channel 1: 32768 taps compared, worst error 4.66e-10 ... -> ok
+convolution verified
+```
+
+(24-bit output quantises at 6e-8, so that error is three orders of magnitude
+below one LSB.) `install.sh` runs this as its last step.
 
 `make test` round-trips real LDAC frames from Sony's encoder through the decoder
 at every LDAC sample rate and checks the recovered signal; `install.sh` refuses

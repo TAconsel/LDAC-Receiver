@@ -27,6 +27,15 @@ BLUEZ_TARBALL_URL="https://www.kernel.org/pub/linux/bluetooth"
 # definitions in config/asound.conf name the card too.
 CARD="${CARD:-U192k}"
 
+# Room correction. IR is a WAV holding one impulse response per channel at the
+# playback rate; see config/camilladsp-roomcorr.yaml.
+IR="${IR:-$HERE/Test900.wav}"
+CDSP_DIR=/etc/camilladsp
+ALSA_CDSP_SRC="${ALSA_CDSP_SRC:-$HOME/alsa_cdsp}"
+ALSA_CDSP_REPO="https://github.com/scripple/alsa_cdsp.git"
+# v4 needs glibc 2.34; bullseye has 2.31. v3.0.1 is the newest that runs here.
+CAMILLADSP_VERSION="${CAMILLADSP_VERSION:-v3.0.1}"
+
 PREFIX=/usr/local
 DEC_INCLUDEDIR="$PREFIX/include/ldac-dec"
 
@@ -59,6 +68,11 @@ if [[ $MODE == uninstall ]]; then
 	sudo rm -f /etc/asound.conf
 	# Back to the distribution bluetoothd.
 	sudo rm -f /usr/local/libexec/bluetooth/bluetoothd
+
+	say "Removing room correction"
+	sudo rm -rf "$CDSP_DIR"
+	sudo rm -f /usr/local/bin/camilladsp
+	[[ -d $ALSA_CDSP_SRC ]] && sudo make -C "$ALSA_CDSP_SRC" uninstall || true
 	sudo systemctl daemon-reload
 	sudo systemctl restart bluetooth || true
 
@@ -173,6 +187,43 @@ aplay -l | grep -qE "^card [0-9]+: $CARD \[" || \
 	die "sound card '$CARD' not found; check 'aplay -l'"
 sudo install -m 0644 "$HERE/config/asound.conf" /etc/asound.conf
 
+# --- room correction --------------------------------------------------------
+# snd-aloop is absent from this board's BSP kernel, so the audio does not reach
+# CamillaDSP through a loopback device.  The alsa_cdsp plugin instead presents
+# itself to BlueALSA as an ALSA device, starts CamillaDSP when the device is
+# opened, and pipes the audio to its stdin; CamillaDSP owns the sound card from
+# there.  Nothing kernel-side is involved.
+say "Installing CamillaDSP $CAMILLADSP_VERSION"
+if ! command -v camilladsp >/dev/null ||
+		[[ $(camilladsp --version 2>/dev/null) != *"${CAMILLADSP_VERSION#v}"* ]]; then
+	tmp=$(mktemp -d)
+	curl -fsSL -o "$tmp/cdsp.tar.gz" \
+		"https://github.com/HEnquist/camilladsp/releases/download/$CAMILLADSP_VERSION/camilladsp-linux-aarch64.tar.gz" ||
+		die "couldn't download CamillaDSP $CAMILLADSP_VERSION"
+	tar xzf "$tmp/cdsp.tar.gz" -C "$tmp"
+	sudo install -m 0755 "$tmp/camilladsp" /usr/local/bin/camilladsp
+	rm -rf "$tmp"
+fi
+# Newer releases are built against a glibc this distribution does not have, and
+# fail at exec with "GLIBC_2.34 not found" rather than anything more helpful.
+camilladsp --version >/dev/null 2>&1 ||
+	die "the CamillaDSP binary will not run here; check 'camilladsp --version'
+       (releases after v3.0.1 need glibc 2.34, this system has $(ldd --version | head -1 | grep -oE '[0-9]+\.[0-9]+$'))"
+
+say "Building the alsa_cdsp plugin"
+[[ -d $ALSA_CDSP_SRC ]] || git clone --depth 1 "$ALSA_CDSP_REPO" "$ALSA_CDSP_SRC"
+make -C "$ALSA_CDSP_SRC" -j"$(nproc)"
+sudo make -C "$ALSA_CDSP_SRC" install
+
+say "Installing the room correction filter"
+[[ -f $IR ]] || die "impulse response not found: $IR"
+sudo install -d "$CDSP_DIR"
+sudo install -m 0644 "$IR" "$CDSP_DIR/$(basename "$IR")"
+sudo install -m 0644 "$HERE/config/camilladsp-roomcorr.yaml" "$CDSP_DIR/roomcorr.yaml"
+camilladsp -c "$CDSP_DIR/roomcorr.yaml" >/dev/null 2>&1 ||
+	die "CamillaDSP rejected $CDSP_DIR/roomcorr.yaml; run
+       'camilladsp -c $CDSP_DIR/roomcorr.yaml' to see why"
+
 # PulseAudio registers its own A2DP endpoints with BlueZ and would compete with
 # BlueALSA for them, and would also hold the sound card.  This box is a headless
 # appliance, so it is masked rather than reconfigured.
@@ -227,6 +278,11 @@ for u in bluetooth bluealsa bluealsa-aplay bt-agent; do
 		printf '  %-22s NOT ACTIVE\n' "$u"; fail=1
 	fi
 done
+
+# Runs the installed config offline and checks that an impulse comes back out as
+# the filter, so a silently mis-wired DSP path is caught here rather than by ear.
+say "Verifying the room correction"
+"$HERE/tools/verify-convolution.sh" | tail -6
 
 "$HERE/tools/ldac-status.sh" || true
 

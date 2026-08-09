@@ -1,0 +1,84 @@
+# CamillaDSP room correction for the Bluetooth receiver.
+# Installed as /etc/camilladsp/roomcorr.yaml.
+#
+# Started by the alsa_cdsp plugin, one process per stream, with the stream's
+# actual parameters passed on the command line (-f/-r/-n/-e), which override
+# what is written here.  The ALSA `dsp96` device in /etc/asound.conf pins those
+# to S32_LE / 96000 / 2ch, so in practice the overrides always match the values
+# below — the filter is designed for 96 kHz and must not run at anything else.
+#
+# Signal path:
+#   stdin (2ch from bluealsa-aplay) -> per-channel convolution -> mixer -> 4ch out
+#
+# The UMC404HD is a fixed 4-channel device, so the mixer widens stereo to its
+# 4 channels and leaves outputs 3 and 4 silent.  Its 24-bit samples ride in
+# 32-bit containers, hence S32LE at 96000.
+
+devices:
+  samplerate: 96000
+  # 4096 frames = 42.7 ms per chunk at 96 kHz.  Large enough that partitioned
+  # convolution of a 32768 tap filter stays cheap on this board's Cortex-A55s.
+  chunksize: 4096
+  queuelimit: 1
+  capture:
+    type: Stdin
+    channels: 2
+    format: S32LE
+    # Flush the filter tail at end of stream: one filter length.  The plugin
+    # passes the same value with -e.
+    extra_samples: 32768
+  playback:
+    type: Alsa
+    channels: 4
+    device: "hw:U192k,0"
+    format: S32LE
+
+filters:
+  # Test900.wav holds one impulse response per channel: 32768 taps at 96 kHz
+  # (341 ms), float32.  Its peak sits at ~45.5 ms, so it is a linear-phase
+  # correction and adds that much latency on top of the Bluetooth delay.
+  #
+  # Measured maximum gain is -0.25 dB (left) and -1.15 dB (right), i.e. the
+  # filter is already normalised so it cannot clip.  If you replace it with one
+  # that boosts anywhere, add a Gain filter ahead of these with a matching
+  # negative gain.
+  roomcorr_left:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: /etc/camilladsp/Test900.wav
+      channel: 0
+  roomcorr_right:
+    type: Conv
+    parameters:
+      type: Wav
+      filename: /etc/camilladsp/Test900.wav
+      channel: 1
+
+mixers:
+  stereo_to_umc404hd:
+    channels:
+      in: 2
+      out: 4
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: 0
+      - dest: 1
+        sources:
+          - channel: 1
+            gain: 0
+      # Outputs 3 and 4 exist only because the card demands 4 channels; no
+      # source is mapped to them, so they stay silent.  To mirror the pair,
+      # add dest 2 from channel 0 and dest 3 from channel 1.
+
+pipeline:
+  - type: Filter
+    channels: [0]
+    names: [roomcorr_left]
+  - type: Filter
+    channels: [1]
+    names: [roomcorr_right]
+  - type: Mixer
+    name: stereo_to_umc404hd
