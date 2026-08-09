@@ -9,9 +9,8 @@ BlueZ 5.55, AIC8800D80 Bluetooth) with a Behringer UMC404HD, receiving from a
 PipeWire 1.6.2 sender.
 
 ```
-sender ─LDAC/A2DP─▶ bluealsad ─▶ libldacBT_dec ─▶ "dsp96" ─▶ CamillaDSP ─┐
-                    (A2DP sink)  (libldacdec)     alsa_cdsp  convolution  ├─▶ dmix ─▶ UMC404HD
-sender ─LDAC/A2DP─▶ bluealsad ─▶ libldacBT_dec ─▶ "dsp96" ─▶ CamillaDSP ─┘          24-bit/96 kHz
+sender ──LDAC/A2DP──▶ bluealsad ──▶ libldacBT_dec ──▶ ALSA "dsp96" ──▶ CamillaDSP ──▶ UMC404HD
+                      (A2DP sink)   (libldacdec)      alsa_cdsp        convolution    24-bit/96 kHz
 ```
 
 ## Install
@@ -271,38 +270,6 @@ despite not being documented as such. What is left is the namespace and mount
 half, which is the part that matters: a read-only system, no home directories,
 private `/tmp`. `ReadWritePaths=/etc/default` is the single hole, because the
 mount namespace applies to the sudo'd helper too and it has to save settings.
-
-## Two devices at once
-
-Two (or more) paired devices can be connected and play **at the same time**;
-their audio is summed. Each stream gets its own CamillaDSP instance and they
-meet at an ALSA `dmix` in front of the card.
-
-That is what `dmix` is there for. A sound card can only be opened once, so
-without it the second stream dies with `snd_pcm_open ... Device or resource
-busy` — the device stays connected and silently plays nothing, which is easy to
-mistake for a Bluetooth problem.
-
-**The correction stays correct.** Convolution is linear, so correcting each
-stream and then summing is identical to summing and then correcting. Running one
-filter per stream also means no stream has to wait for another.
-
-**Cost.** About 22% of one Cortex-A55 core per stream — two streams measured at
-46–48% of a core, under 6% of the board. `dmix` sums in the 32-bit domain at the
-card's own rate and format, so nothing is resampled or requantised on the way
-through, and with a single stream the sum is that stream.
-
-**Level.** Two streams near full scale will sum above it; `dmix` clamps rather
-than wrapping, so it distorts instead of exploding, but if you routinely play two
-at once, leave some headroom on the output slider.
-
-**`dmix` needs tuning here, and the defaults are wrong for this path.** Its
-period is set to match CamillaDSP's chunksize with a 341 ms buffer. At the usual
-2048/16384 the writes become bursty enough to push jitter back up the pipe to
-`bluealsa-aplay`: a 40-second stream logged **50** drain-to-avoid-underrun events
-instead of **1**. It also needs `format`, `rate` and `channels` repeated inside
-its `slave` block — `dmix` does not inherit them from the referenced PCM and
-otherwise assumes stereo, failing with `invalid slave channel number 2`.
 
 ## Pairing
 

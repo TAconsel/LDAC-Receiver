@@ -28,14 +28,9 @@ devices:
     # passes the same value with -e.
     extra_samples: 32768
   playback:
-    # Not the card directly: `umc404hd_dmix` in /etc/asound.conf, so a second
-    # Bluetooth device gets its own CamillaDSP instance and the two are summed
-    # rather than the second failing to open the card.  Convolution is linear,
-    # so correcting each stream and then summing is the same as summing and then
-    # correcting.
     type: Alsa
     channels: 4
-    device: "umc404hd_dmix"
+    device: "hw:U192k,0"
     format: S32LE
 
 filters:
