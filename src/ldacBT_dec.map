@@ -1,0 +1,18 @@
+/* Only the two decoder entry points leave this library.
+ *
+ * libldacdec and the glue bring in a large number of other symbols, and the
+ * process also loads libldacBT_enc, which exports ldacBT_get_handle,
+ * ldacBT_free_handle, ldacBT_get_error_code and friends.  BlueALSA links this
+ * library ahead of the encoder (@LDAC_DEC_LIBS@ precedes @LDAC_ENC_LIBS@), so
+ * anything exported here with a shared name would take precedence over the
+ * encoder's own definition for the whole process — including for calls made
+ * from inside libldacBT_enc itself.  Keeping everything else local makes that
+ * impossible by construction.
+ */
+LDACBT_DEC_2.0 {
+global:
+	ldacBT_init_handle_decode;
+	ldacBT_decode;
+local:
+	*;
+};

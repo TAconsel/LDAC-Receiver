@@ -1,0 +1,8 @@
+build/
+*.o
+*.d
+*.so
+*.so.*
+ldacBT-dec.pc
+tests/test-decode
+tests/test-ldacbt-dec

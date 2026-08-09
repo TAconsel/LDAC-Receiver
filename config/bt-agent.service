@@ -1,0 +1,32 @@
+# Installed as /etc/systemd/system/bt-agent.service
+#
+# Pairing needs an agent registered on the system bus to answer BlueZ's
+# requests.  On a headless box there is nobody to confirm a passkey, so the
+# agent declares NoInputNoOutput capability, which selects the "just works"
+# association model: pairing completes without interaction.
+#
+# Combined with bluetooth-sink-setup.service leaving the adapter permanently
+# discoverable and pairable, that means any device in radio range can pair with
+# this box and play audio through it — the same posture as a consumer Bluetooth
+# speaker.  To require a PIN instead, use:
+#
+#     ExecStart=/usr/bin/bt-agent -c DisplayYesNo -p /etc/bluetooth/pins.conf
+#
+# with lines of the form `* 1234` in that file, and make it mode 0600.
+
+[Unit]
+Description=Bluetooth pairing agent (just-works, headless)
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bt-agent -c NoInputNoOutput
+Restart=on-failure
+RestartSec=2
+# bt-agent does not act on SIGTERM, so a plain restart would sit in
+# "deactivating" until systemd's 90 s default expires.
+TimeoutStopSec=5
+
+[Install]
+WantedBy=bluetooth.target

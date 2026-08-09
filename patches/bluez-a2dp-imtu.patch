@@ -1,0 +1,47 @@
+Raise the AVDTP incoming MTU so LDAC can be received.
+
+BlueZ listens for AVDTP connections without asking for an L2CAP incoming MTU,
+so the signalling channel — and with it the media transport channel, which
+inherits session->imtu in avdtp_connect_cb() — falls back to the L2CAP default
+of 672 bytes.  That is the MTU this machine advertises to a sender, and it
+becomes the sender's *outgoing* MTU for the media channel.
+
+Sony's LDAC encoder refuses to initialise below 679 bytes:
+ldacBT_init_handle_encode() returns LDACBT_ERR_ILL_MTU_SIZE.  A sender that
+negotiated LDAC with us therefore cannot start its encoder at all — PipeWire
+logs "LDAC encoder initialization failed: LDACBT_ERR_ILL_MTU_SIZE" and streams
+nothing, while BlueZ still reports the transport as "active".  Nothing arrives,
+and there is no error on the receiving side to explain it.
+
+SBC and AAC pack into far smaller packets, so they work at 672 and hide the
+problem; only LDAC fails, which makes this look like a codec bug rather than an
+MTU one.
+
+1024 is chosen to match LDACBT_MAX_NBYTES, the largest LDAC transport frame,
+leaving the sender free to fill packets rather than fragmenting every frame.
+L2CAP splits them to the controller's ACL MTU transparently.
+
+--- a/profiles/audio/a2dp.c
++++ b/profiles/audio/a2dp.c
+@@ -70,6 +70,13 @@
+
+ #define AVDTP_PSM 25
+
++/* L2CAP incoming MTU to advertise for AVDTP.
++ *
++ * The default of 672 is below the 679 byte floor Sony's LDAC encoder accepts,
++ * which silently prevents senders from streaming LDAC to us.  LDACBT_MAX_NBYTES
++ * is 1024, so this holds a whole LDAC transport frame. */
++#define AVDTP_IMTU 1024
++
+ #define MEDIA_ENDPOINT_INTERFACE "org.bluez.MediaEndpoint1"
+
+ struct a2dp_sep {
+@@ -2346,6 +2353,7 @@ static bool a2dp_server_listen(struct a2
+ 				BT_IO_OPT_SOURCE_BDADDR,
+ 				btd_adapter_get_address(server->adapter),
+ 				BT_IO_OPT_PSM, AVDTP_PSM,
++				BT_IO_OPT_IMTU, AVDTP_IMTU,
+ 				BT_IO_OPT_MODE, mode,
+ 				BT_IO_OPT_SEC_LEVEL, BT_IO_SEC_MEDIUM,
+ 				BT_IO_OPT_MASTER, true,
