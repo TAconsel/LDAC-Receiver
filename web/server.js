@@ -132,6 +132,27 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, await ctl([verb, state]));
   }
 
+  if (url.pathname === '/api/volume') {
+    // Mute and level are separate requests; a body with both is ambiguous.
+    if ('muted' in body) {
+      const state = onOff(body.muted);
+      if (state === null) {
+        return sendJson(res, 400, { ok: false, error: '"muted" must be true or false' });
+      }
+      return sendJson(res, 200, await ctl(['volume', 'mute', state]));
+    }
+    // Deliberately not Number(body.db): that turns null, "" and [] into 0,
+    // which would read as "set full volume" for a request that said no such
+    // thing.  Only an actual JSON number is accepted.
+    const db = body.db;
+    if (typeof db !== 'number' || !Number.isFinite(db) || db > 0 || db < -127) {
+      return sendJson(res, 400, {
+        ok: false, error: '"db" must be a number between -127 and 0',
+      });
+    }
+    return sendJson(res, 200, await ctl(['volume', 'set', String(Math.round(db))]));
+  }
+
   if (url.pathname === '/api/device') {
     const action = String(body.action || '');
     const mac = String(body.mac || '').toUpperCase();

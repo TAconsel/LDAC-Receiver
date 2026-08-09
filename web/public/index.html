@@ -98,6 +98,35 @@
   button:disabled { opacity: .45; cursor: default; }
   button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
 
+  /* volume */
+  .vol-read { font-size: 1.5rem; font-weight: 650; font-variant-numeric: tabular-nums;
+              letter-spacing: -0.02em; }
+  .vol-read.muted { color: var(--muted); text-decoration: line-through; }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 100%; margin: .9rem 0 .2rem;
+    background: transparent; cursor: pointer;
+  }
+  input[type=range]:disabled { opacity: .5; cursor: default; }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 6px; border-radius: 999px; background: var(--line);
+  }
+  input[type=range]::-moz-range-track {
+    height: 6px; border-radius: 999px; background: var(--line);
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; margin-top: -7px;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: var(--accent); border: 2px solid var(--card);
+    box-shadow: 0 1px 4px rgba(0,0,0,.35);
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--card);
+    background: var(--accent); box-shadow: 0 1px 4px rgba(0,0,0,.35);
+  }
+  input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+  .scale { display: flex; justify-content: space-between;
+           color: var(--muted); font-size: .74rem; font-variant-numeric: tabular-nums; }
+
   #toast {
     position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);
     background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--accent);
@@ -133,6 +162,20 @@
         <span class="track"></span>
       </label>
     </div>
+  </section>
+
+  <section>
+    <h2>Output level</h2>
+    <div class="row">
+      <div class="grow">
+        <div class="vol-read" id="voldb">—</div>
+        <div class="hint" id="volhint">the interface's own attenuator</div>
+      </div>
+      <button id="mute" disabled>Mute</button>
+    </div>
+    <input type="range" id="vol" min="-80" max="0" step="1" value="0" disabled
+           aria-label="Output level in decibels">
+    <div class="scale"><span id="volmin">−80 dB</span><span>0 dB</span></div>
   </section>
 
   <section>
@@ -255,6 +298,85 @@ function renderClients(devices) {
   }).join('');
 }
 
+// --- output level ----------------------------------------------------------
+// The slider is the one control the user drags, so polling must not yank it
+// out from under them: refreshes leave it alone while a drag is in progress and
+// for a moment after a value is sent, by which time the readback agrees.
+let dragging = false;
+let volSettleUntil = 0;
+let volPending = null;
+let volTimer = null;
+
+function showVolume(db, muted) {
+  const el = $('voldb');
+  el.textContent = `${db > 0 ? '+' : db < 0 ? '−' : ''}${Math.abs(Math.round(db))} dB`;
+  el.classList.toggle('muted', !!muted);
+}
+
+async function sendVolume(db) {
+  volSettleUntil = Date.now() + 1200;
+  try {
+    const r = await api('/api/volume', { method: 'POST', body: JSON.stringify({ db }) });
+    if (r && r.ok === false) toast(r.error || 'volume change failed', true);
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/* Coalesce a drag into at most one request every 120 ms, then one final one. */
+function queueVolume(db) {
+  volPending = db;
+  if (volTimer) return;
+  volTimer = setTimeout(() => {
+    volTimer = null;
+    const value = volPending;
+    volPending = null;
+    if (value !== null) sendVolume(value);
+  }, 120);
+}
+
+$('vol').addEventListener('input', (e) => {
+  dragging = true;
+  const db = Number(e.target.value);
+  showVolume(db, false);
+  queueVolume(db);
+});
+$('vol').addEventListener('change', (e) => {
+  dragging = false;
+  sendVolume(Number(e.target.value)).then(refresh);
+});
+$('mute').addEventListener('click', () => {
+  const muted = $('mute').dataset.muted === '1';
+  act(() => api('/api/volume', {
+    method: 'POST', body: JSON.stringify({ muted: !muted }),
+  }), null);
+});
+
+function renderVolume(v) {
+  const slider = $('vol');
+  const mute = $('mute');
+  if (!v || !v.available) {
+    slider.disabled = true;
+    mute.disabled = true;
+    $('voldb').textContent = '—';
+    $('volhint').textContent = (v && v.error) || 'no hardware volume control';
+    return;
+  }
+  slider.min = v.floor_db;
+  $('volmin').textContent = `−${Math.abs(v.floor_db)} dB`;
+  slider.disabled = false;
+  mute.disabled = false;
+  mute.textContent = v.muted ? 'Unmute' : 'Mute';
+  mute.dataset.muted = v.muted ? '1' : '0';
+  $('volhint').textContent = v.muted
+    ? `${v.control} — muted`
+    : `${v.control} — step ${v.raw} of 127`;
+  if (!dragging && Date.now() > volSettleUntil) {
+    slider.value = Math.max(Number(v.floor_db), v.db);
+    showVolume(v.db, v.muted);
+  }
+}
+
 function render(s) {
   const a = s.adapter || {};
   $('devname').textContent = a.name || 'LDAC Receiver';
@@ -276,6 +398,7 @@ function render(s) {
     ? 'Visible to nearby devices, and accepting new pairings'
     : 'Hidden. Already-paired clients can still connect.';
 
+  renderVolume(s.volume);
   renderFacts(s);
   renderClients(s.devices);
 }

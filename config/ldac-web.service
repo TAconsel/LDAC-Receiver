@@ -56,9 +56,11 @@ UMask=0077
 
 # The mount namespace applies to everything started from here, sudo included, so
 # ldac-ctl would find /etc read-only and be unable to save the panel's settings.
-# This is the one directory it writes, and only root can write inside it — the
-# panel's own user still cannot touch the root-owned file there.
-ReadWritePaths=/etc/default
+# These are the only directories it writes, and only root can write inside them —
+# the panel's own user still cannot touch the root-owned files there.
+# /var/lib/alsa is for `alsactl store`, so a level set in the panel survives a
+# power cut rather than only a clean shutdown.
+ReadWritePaths=/etc/default /var/lib/alsa
 
 [Install]
 WantedBy=multi-user.target

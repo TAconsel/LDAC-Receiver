@@ -11,6 +11,8 @@ Verbs:
     status                      everything the panel displays, as JSON
     convolution on|off          route Bluetooth audio through CamillaDSP or not
     discoverable on|off         adapter visibility, persisted across reboots
+    volume set DB               interface output level, in dB (<= 0)
+    volume mute on|off          interface output mute
     device connect|disconnect|trust|untrust|remove MAC
     apply-boot                  restore the persisted state at boot
 
@@ -36,6 +38,15 @@ PCM_DIRECT = "ldac96"
 
 MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
 SERVICES = ("bluetooth", "bluealsa", "bluealsa-aplay", "bt-agent", "ldac-web")
+
+# The interface's own output attenuator, the same element BlueALSA would drive
+# if it were in mixer mode.  On the UMC404HD it is 128 steps of exactly 1 dB
+# from 0 down to -127 dB, so it is presented and set in dB rather than as a
+# percentage: 50% of the raw range would be -63 dB, which is silence.
+MIXER_CONTROL = os.environ.get("LDAC_MIXER_CONTROL", "UMC404HD 192k Output")
+# How far down the panel's slider goes.  Everything below is inaudible anyway,
+# and mute is a separate button.
+VOLUME_FLOOR_DB = -80.0
 
 
 def run(argv, timeout=15):
@@ -233,6 +244,86 @@ def card_state():
     return out
 
 
+def volume_state():
+    """The interface's hardware output level.
+
+    Read from the first playback channel; the element covers all four outputs
+    and they are always set together.
+    """
+    rc, out = run(["amixer", "-c", CARD, "sget", MIXER_CONTROL])
+    if rc != 0:
+        return {"available": False, "error": "no '%s' control on card %s"
+                                             % (MIXER_CONTROL, CARD)}
+    m = re.search(r"Playback (\d+) \[(\d+)%\] \[(-?[\d.]+)dB\] \[(on|off)\]", out)
+    if not m:
+        # Some controls have no dB scale; without one a dB slider is meaningless.
+        return {"available": False, "error": "control has no dB scale"}
+    return {
+        "available": True,
+        "control": MIXER_CONTROL,
+        "raw": int(m.group(1)),
+        "percent": int(m.group(2)),
+        "db": float(m.group(3)),
+        "muted": m.group(4) == "off",
+        "floor_db": VOLUME_FLOOR_DB,
+    }
+
+
+# alsactl lives in /usr/sbin, which is not on every caller's PATH.
+ALSACTL = next((p for p in ("/usr/sbin/alsactl", "/sbin/alsactl",
+                            "/usr/bin/alsactl") if os.path.exists(p)), None)
+
+
+def store_mixer():
+    """Persist the mixer immediately.  Returns whether it worked.
+
+    alsa-restore.service puts the mixer back at boot from a file it only writes
+    on a clean shutdown, so without this a level set here would be lost on a
+    power cut — and the card comes back at 0 dB, which is full output.
+
+    --no-lock: alsactl's lock file lives in /var/lock, which is read-only inside
+    the control panel's mount namespace, so locking cannot work there; worse, an
+    interrupted run leaves the lock behind and every later store fails with
+    "File exists" until someone deletes it by hand.  Nothing else writes this
+    state except alsa-restore at boot and shutdown, so the lock buys nothing
+    here and costs a silent failure mode.
+    """
+    if ALSACTL is None:
+        return False
+    rc, _ = run([ALSACTL, "--no-lock", "store", CARD])
+    return rc == 0
+
+
+def cmd_volume(action, value):
+    if action == "mute":
+        on = want_on(value)
+        rc, _ = run(["amixer", "-c", CARD, "-q", "sset", MIXER_CONTROL,
+                     "off" if on else "on"])
+        if rc != 0:
+            fail("could not change mute")
+        return {"ok": True, "persisted": store_mixer(), "volume": volume_state()}
+
+    if action != "set":
+        fail("unknown volume action: %r" % action)
+
+    try:
+        db = float(value)
+    except ValueError:
+        fail("volume must be a number of dB, got %r" % value)
+    if db != db or db in (float("inf"), float("-inf")):
+        fail("volume must be a real number of dB")
+    # Never above unity: this is an attenuator, and the card would clamp anyway.
+    db = max(-127.0, min(0.0, db))
+    # `--` so a negative value is not taken for an option.
+    rc, _ = run(["amixer", "-c", CARD, "-q", "--", "sset", MIXER_CONTROL,
+                 "%.0fdB" % db])
+    if rc != 0:
+        fail("could not set volume")
+    # Reported rather than swallowed: if this is false the level is live but
+    # will not survive a reboot, which is worth knowing.
+    return {"ok": True, "persisted": store_mixer(), "volume": volume_state()}
+
+
 def camilladsp_state():
     rc, out = run(["pgrep", "-a", "camilladsp"])
     if rc != 0 or not out.strip():
@@ -275,6 +366,7 @@ def cmd_status():
         "adapter": adapter_state(),
         "stream": stream_state(),
         "card": card_state(),
+        "volume": volume_state(),
         "services": services_state(),
         "devices": paired_devices(),
     }
@@ -358,6 +450,8 @@ def main(argv):
         result = cmd_convolution(args[0])
     elif verb == "discoverable" and len(args) == 1:
         result = cmd_discoverable(args[0])
+    elif verb == "volume" and len(args) == 2:
+        result = cmd_volume(args[0], args[1])
     elif verb == "device" and len(args) == 2:
         result = cmd_device(args[0], args[1])
     elif verb == "apply-boot" and not args:

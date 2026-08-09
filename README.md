@@ -167,10 +167,29 @@ explanation.
 
 ## Control panel
 
-`http://<box>:8080/` — room correction on/off, Bluetooth discoverable on/off,
-and the paired clients (connect, disconnect, trust, remove), with the live codec,
-sample rate and output format. It polls every 5 seconds and stops while the tab
-is hidden.
+`http://<box>:8080/` — room correction on/off, the interface's output level,
+Bluetooth discoverable on/off, and the paired clients (connect, disconnect,
+trust, remove), with the live codec, sample rate and output format. It polls
+every 5 seconds and stops while the tab is hidden.
+
+**Output level.** The slider drives the UMC404HD's own attenuator, and it is
+calibrated **in dB, not percent**, because that control is 128 steps of exactly
+1 dB from 0 down to −127 dB: a percentage slider would put half its travel below
+−63 dB, which is silence. It runs 0 to −80 dB, with mute as a separate button.
+
+Two volume controls with separate jobs, which is why `bluealsa-aplay` runs with
+`--volume=software` rather than the more obvious `--volume=mixer`:
+
+| | |
+| --- | --- |
+| the sender's volume | applied digitally, before the DSP |
+| this slider | the interface's analogue output level |
+
+In `--volume=mixer` the daemon writes that same mixer whenever the remote
+changes volume, so the slider snaps back under your finger while a device is
+connected — verified, and the reason for the change. For bit-perfect output,
+leave the sender at 100% and set the level here: nothing then scales the samples
+anywhere in the path.
 
 **Read this before putting it on your network: there is no password by
 default.** Anyone who can reach the port can unpair your devices and toggle the
@@ -205,6 +224,8 @@ browser:
 ```sh
 sudo ldac-ctl status                     # everything, as JSON
 sudo ldac-ctl convolution off            # bypass room correction
+sudo ldac-ctl volume set -18             # output level, in dB
+sudo ldac-ctl volume mute on
 sudo ldac-ctl discoverable off           # hide the adapter
 sudo ldac-ctl device remove AA:BB:CC:DD:EE:FF
 ```
@@ -227,6 +248,7 @@ card exclusively, so the path cannot be swapped underneath a running stream.
 | `GET /api/status` | everything the page shows |
 | `POST /api/convolution` | `{"enabled": true\|false}` |
 | `POST /api/discoverable` | `{"enabled": true\|false}` |
+| `POST /api/volume` | `{"db": -18}` or `{"muted": true\|false}` |
 | `POST /api/device` | `{"action": "connect\|disconnect\|trust\|untrust\|remove", "mac": "…"}` |
 
 **systemd sandboxing note.** `ldac-web.service` looks under-hardened on purpose.
