@@ -349,6 +349,60 @@ this. On Android, Developer options → Bluetooth audio quality → prefer
 room correction off in the panel is also a valid answer: the direct path has
 fewer moving parts and no CamillaDSP restart to race.
 
+## Bandwidth, and why 990 kbps is marginal
+
+Measured on a live link with a phone at LDAC's top rate, from the HCI byte and
+packet counters:
+
+| | |
+| --- | --- |
+| throughput | 1012–1023 kbps |
+| packet rate | 186–187 packets/s |
+| mean ACL payload | **679 bytes** |
+
+Those three numbers explain the whole situation.
+
+LDAC at 96 kHz packs 256 samples per frame, so it produces a fixed **375
+frames/s** regardless of bitrate, and the phone puts **2 frames in every
+packet** — 187 packets/s, exactly what is measured. 679 bytes is precisely the
+maximum payload of a **2-DH5** packet, so the sender is sizing packets to fill
+one and no more.
+
+A 2-DH5 is a 5-slot transmission, plus one slot for the acknowledgement: 6 ×
+625 µs = 3.75 ms per packet. At 187 packets/s that is **703 ms of every second,
+or about 70% of the air**. Which is why it works but has little margin — the
+remaining 30% is all that retransmissions and any other 2.4 GHz activity have to
+share.
+
+**This cannot be improved from the receiver.** The packet rate is set by LDAC's
+frame rate, not by anything here, and the sender will not exceed 679 bytes even
+though we advertise a 1024-byte AVDTP MTU — that ceiling is its own controller's,
+so raising ours further buys nothing.
+
+What *did* help was giving the radio back the airtime it was leaking:
+
+* **Sniff mode is now off.** It was permitted on the A2DP link (`RSWITCH SNIFF`).
+  Sniff lets the controller park the link into a duty cycle to save power; at 70%
+  utilisation there is no airtime to give away, and entering or leaving sniff
+  mid-stream bunches packets up and is heard as a stutter. `ldac-ctl` clears it
+  from the default policy at boot and from each link as it connects. The box is
+  mains powered, so the power saving buys nothing.
+* **Wi-Fi is off.** The AIC8800D80 is a combo Wi-Fi/Bluetooth part sharing one
+  radio, and `wlan0` was up and unassociated — which still scans periodically,
+  stealing airtime from a link that has none spare. The board is on Ethernet:
+
+  ```sh
+  sudo nmcli radio wifi off     # persists in NetworkManager's state
+  ```
+
+  Re-enable with `on` if you need Wi-Fi; expect 990 kbps to suffer for it.
+
+After both: **3 minutes at 990 kbps with one glitch event.** Good, but 70% is
+70%. If it stutters where you actually use it — further from the phone, or with
+other 2.4 GHz traffic around — drop the sender to ABR ("Optimize for connection
+quality") or a fixed 660 kbps. The audible difference is very small; the
+reliability difference is not.
+
 ## Pairing
 
 The board is permanently discoverable and pairable as `radxa-cubie-a7s`, and

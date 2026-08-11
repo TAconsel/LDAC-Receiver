@@ -269,8 +269,15 @@ def cmd_watch_single_link():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
+    seen = None
     while not stopping["now"]:
-        apply_link_gate()
+        primary = apply_link_gate()
+        if primary is not None and primary != seen:
+            # A newly arrived link keeps whatever policy it negotiated, so the
+            # default set at boot does not reach it.  Clearing sniff here costs
+            # one command per connection, not one per poll.  See cmd_apply_boot.
+            run(["hcitool", "lp", primary, "rswitch"])
+        seen = primary
         time.sleep(SINGLE_LINK_POLL_SECONDS)
 
     # Leave the adapter reachable on the way out, or stopping this service would
@@ -651,6 +658,16 @@ def cmd_apply_boot():
     run(["btmgmt", "power", "on"])
     run(["btmgmt", "connectable", "on"])
     run(["btmgmt", "bondable", "on"])
+
+    # Drop sniff mode from the default link policy, keeping role switch.
+    #
+    # Sniff lets the controller park the link into a duty cycle to save power.
+    # On an A2DP link at LDAC's top bitrate there is no spare airtime to give
+    # away, and a link entering or leaving sniff mid-stream bunches packets up,
+    # which is heard as a stutter.  This box is mains powered, so the power
+    # saving buys nothing.  hcitool's own name for "role switch only" is
+    # `rswitch`; it replaces the whole mask rather than adding to it.
+    run(["hciconfig", "hci0", "lp", "rswitch"])
     discoverable = values.get("LDAC_DISCOVERABLE", "on")
     run(["btmgmt", "discov", "on" if discoverable == "on" else "off"])
     return {"ok": True, "adapter": adapter_state()}
