@@ -1,0 +1,36 @@
+# Installed as /etc/systemd/system/ldac-audio-watchdog.service
+#
+# Recovers the one failure that leaves the receiver looking perfectly healthy
+# and playing nothing.
+#
+# Seen with a phone as the source: heavy jitter makes bluealsa-aplay drain and
+# reopen the output, and it comes back with the sound card sitting in PREPARED
+# having never written a frame, while BlueALSA's decoder keeps overrunning its
+# FIFO behind it.  The A2DP transport still reports "running", every service is
+# still active, the control panel still shows the codec and rate — and there is
+# no sound until something restarts the player.  It does not recover on its own,
+# and the wedged player ignores SIGTERM.
+#
+# So this watches for that exact signature — a stream running while the card's
+# playback position does not move — and restarts the player, with SIGKILL first
+# because the polite route has been observed not to work.
+#
+# It is a recovery mechanism, not a fix: where bluealsa-aplay actually wedges is
+# not pinned down.  Disable it if you would rather see the failure than have it
+# papered over:
+#
+#     sudo systemctl disable --now ldac-audio-watchdog
+
+[Unit]
+Description=Restart the LDAC player if audio stops reaching the sound card
+After=bluealsa.service bluealsa-aplay.service
+Wants=bluealsa-aplay.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ldac-ctl watch-playback
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=bluetooth.target

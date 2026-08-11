@@ -71,6 +71,7 @@ the service at the rebuilt one in `/usr/local/libexec`.
 | `/etc/systemd/system/bt-agent.service` | headless pairing agent |
 | `/etc/systemd/system/bluetooth-sink-setup.service` | discoverable + pairable at boot |
 | `/etc/systemd/system/ldac-single-link.service` | holds the box to one device |
+| `/etc/systemd/system/ldac-audio-watchdog.service` | recovers a wedged player |
 | `/usr/local/bin/node`, `/usr/local/share/ldac-web/` | the control panel |
 | `/usr/local/sbin/ldac-ctl` | its privileged half |
 | `/etc/default/ldac-receiver` | settings the panel writes |
@@ -307,6 +308,46 @@ call made from a unit therefore came back blank, and code that read the result
 as "the adapter has no flags set" silently did nothing at all. `ldac-ctl` gives
 every child an empty pipe instead, which `bt_shell` is happy with. This also
 fixes `bluetooth-sink-setup.service`, whose `btmgmt` calls had the same problem.
+
+## "Connected, but no sound"
+
+There is one failure mode that leaves everything looking healthy and plays
+nothing, and it does not recover on its own. `ldac-audio-watchdog.service`
+exists for it.
+
+What it looks like: the phone or PC is connected, the A2DP transport reports
+`running`, the panel shows the right codec and rate, every service is active —
+and silence. Underneath, the sound card is sitting in `PREPARED` or `XRUN` with
+its playback position frozen, `bluealsa-aplay` has stopped reading, and
+BlueALSA's decoder is logging `Dropping PCM frames: PCM overrun` over and over
+because nothing is draining it. The wedged player ignores SIGTERM, so even a
+restart stalls until systemd's stop timeout expires.
+
+How it starts: heavy jitter from the source makes `bluealsa-aplay` drain and
+reopen the output; it comes back with the card open but never writes a frame.
+
+Two things address it:
+
+* `TimeoutStopSec=10` on the player, so a restart can never take the default
+  90 seconds when it is refusing to die.
+* The watchdog, which looks every 5 seconds for the exact signature — a stream
+  running while the card's position does not move — and after three consecutive
+  strikes (~15 s) SIGKILLs and restarts the player. Measured recovery from a
+  deliberately frozen player: **~20 s**, after which the card is `RUNNING` and
+  advancing at 96 kHz again.
+
+This is recovery, not a cure: where `bluealsa-aplay` actually wedges is not
+pinned down, and `extra_samples` was ruled out (teardown is ~25 ms either way).
+Disable it with `sudo systemctl disable --now ldac-audio-watchdog` if you would
+rather see the failure than have it papered over.
+
+**If it keeps happening, look at the sender's LDAC bitrate.** LDAC's 990 kbps
+mode ("best quality" / "Optimize for sound quality") is right at the edge of
+what a single Bluetooth link carries, and it is the jitter that starts all of
+this. On Android, Developer options → Bluetooth audio quality → prefer
+"Optimize for connection quality" or a fixed rate of 660 kbps or below. Turning
+room correction off in the panel is also a valid answer: the direct path has
+fewer moving parts and no CamillaDSP restart to race.
 
 ## Pairing
 

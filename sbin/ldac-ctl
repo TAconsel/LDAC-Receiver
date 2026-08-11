@@ -18,6 +18,8 @@ Verbs:
     apply-boot                  restore the persisted state at boot
     watch-single-link           run in the foreground, holding the receiver to
                                 one connected device at a time
+    watch-playback              run in the foreground, restarting the player if
+                                a stream stops reaching the sound card
 
 SPDX-License-Identifier: MIT
 """
@@ -43,12 +45,19 @@ PCM_DIRECT = "ldac96"
 
 MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
 SERVICES = ("bluetooth", "bluealsa", "bluealsa-aplay", "bt-agent", "ldac-web",
-            "ldac-single-link")
+            "ldac-single-link", "ldac-audio-watchdog")
 
 # How often watch-single-link looks at the adapter.  Two seconds is well under
 # the time it takes anyone to notice a second device connecting, and each pass
 # is two short commands.
 SINGLE_LINK_POLL_SECONDS = 2.0
+
+# watch-playback: how often to look, and how many consecutive stalled looks
+# before restarting the player.  5 s x 3 is about 15 s of silence — long enough
+# that ordinary jitter, a pause, or a codec change cannot trigger it, short
+# enough that nobody sits there wondering whether the thing is broken.
+PLAYBACK_POLL_SECONDS = 5.0
+PLAYBACK_STALL_STRIKES = 3
 
 # The interface's own output attenuator, the same element BlueALSA would drive
 # if it were in mixer mode.  On the UMC404HD it is 128 steps of exactly 1 dB
@@ -269,6 +278,84 @@ def cmd_watch_single_link():
     run(["btmgmt", "connectable", "on"])
     if read_defaults().get("LDAC_DISCOVERABLE", "on") == "on":
         run(["btmgmt", "discov", "on"])
+    return {"ok": True}
+
+
+def card_hw_ptr():
+    """The card's playback position, or None if it is not open.
+
+    /proc/asound/<card>/pcm0p/sub0/status pads before the colon, and reads
+    "closed" when nothing has the device.  A position that does not move while a
+    Bluetooth stream is running is the signature of the stall this watches for.
+    """
+    try:
+        with open("/proc/asound/%s/pcm0p/sub0/status" % CARD) as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if "closed" in text:
+        return None
+    m = re.search(r"^hw_ptr\s*:\s*(\d+)", text, re.M)
+    # Open but with no position yet (state PREPARED) counts as stalled at 0
+    # rather than as "not open" — that is exactly how the wedge presents.
+    return int(m.group(1)) if m else 0
+
+
+def cmd_watch_playback():
+    """Restart the player if audio stops reaching the card while a stream runs.
+
+    Seen in the wild with a phone: heavy jitter makes bluealsa-aplay drain and
+    reopen the output, and it comes back with the card sitting in PREPARED,
+    zero frames ever written, while BlueALSA's decoder keeps overrunning its
+    FIFO behind it.  The transport stays "running", the panel looks healthy,
+    the services are all active, and there is simply no sound until something
+    restarts the player.
+
+    Where exactly it wedges inside bluealsa-aplay is not pinned down, so this
+    does not pretend to fix it — it detects the signature and recovers, which is
+    the difference between a receiver that occasionally goes quiet forever and
+    one that hiccups for a few seconds.
+    """
+    stopping = {"now": False}
+
+    def stop(_signum, _frame):
+        stopping["now"] = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    strikes = 0
+    last_ptr = None
+    while not stopping["now"]:
+        streaming = stream_state().get("running", False)
+        ptr = card_hw_ptr()
+
+        if not streaming:
+            # Nothing is playing, so a still card is the correct state.
+            strikes, last_ptr = 0, None
+        elif ptr is None:
+            # Streaming with the card shut: normal for a moment while the
+            # player opens it, so let it count towards the strikes rather than
+            # firing immediately.
+            strikes += 1
+        elif last_ptr is not None and ptr == last_ptr:
+            strikes += 1
+        else:
+            strikes = 0
+        last_ptr = ptr
+
+        if strikes >= PLAYBACK_STALL_STRIKES:
+            # SIGKILL, not a polite restart: the wedged player has been seen to
+            # ignore SIGTERM for as long as systemd's stop timeout allows, and
+            # the point of this is to be quicker than that.
+            run(["systemctl", "kill", "-s", "KILL", "bluealsa-aplay"])
+            time.sleep(1)
+            run(["systemctl", "restart", "bluealsa-aplay"], timeout=30)
+            strikes, last_ptr = 0, None
+            time.sleep(PLAYBACK_POLL_SECONDS)
+
+        time.sleep(PLAYBACK_POLL_SECONDS)
+
     return {"ok": True}
 
 
@@ -593,6 +680,8 @@ def main(argv):
         result = cmd_apply_boot()
     elif verb == "watch-single-link" and not args:
         result = cmd_watch_single_link()
+    elif verb == "watch-playback" and not args:
+        result = cmd_watch_playback()
     else:
         fail("unknown verb or wrong number of arguments: %r" % (argv,))
     json.dump(result, sys.stdout)
