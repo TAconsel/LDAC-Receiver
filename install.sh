@@ -26,6 +26,9 @@ BLUEZ_TARBALL_URL="https://www.kernel.org/pub/linux/bluetooth"
 # `amixer controls`.  Override if the interface is a different one; the PCM
 # definitions in config/asound.conf name the card too.
 CARD="${CARD:-U192k}"
+# Its output attenuator.  Has one level per output on this interface, which is
+# what lets the panel move outputs 1-2 and leave the recorder tap at unity.
+MIXER_CONTROL="${MIXER_CONTROL:-UMC404HD 192k Output}"
 
 # Room correction. IR is a WAV holding one impulse response per channel at the
 # playback rate; see config/camilladsp-roomcorr.yaml.
@@ -345,10 +348,17 @@ for u in bluetooth bluealsa bluealsa-aplay bt-agent ldac-web ldac-single-link \
 	fi
 done
 
+# Outputs 3-4 are the uncorrected recorder tap and are held at unity; the panel
+# only ever moves 1-2.  Set it here so a fresh install starts out consistent
+# rather than waiting for the first apply-boot.
+say "Pinning the recorder tap (outputs 3-4) to 0 dB"
+sudo amixer -c "$CARD" -q -- sset "$MIXER_CONTROL" rearleft 0dB unmute || true
+sudo amixer -c "$CARD" -q -- sset "$MIXER_CONTROL" rearright 0dB unmute || true
+
 # Runs the installed config offline and checks that an impulse comes back out as
 # the filter, so a silently mis-wired DSP path is caught here rather than by ear.
 say "Verifying the room correction"
-"$HERE/tools/verify-convolution.sh" | tail -6
+"$HERE/tools/verify-convolution.sh" | tail -8
 
 "$HERE/tools/ldac-status.sh" || true
 

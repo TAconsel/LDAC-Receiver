@@ -88,30 +88,57 @@ The UMC404HD is a fixed **4-channel** device that accepts S16_LE or S32_LE at
 not open with 2 channels, so `/etc/asound.conf` defines:
 
 * `umc404hd_96k` — the hardware, pinned to `S32_LE`, `96000`, 4 channels
-* `ldac96` — a `plug` in front of it routing L/R to outputs 1 and 2
+* `ldac96` — a `plug` in front of it routing L/R to outputs 1+2 and again to 3+4
 
 The rate is pinned rather than followed from the stream, so the interface always
 runs at 24-bit/96 kHz. LDAC at 96 kHz therefore passes through untouched; a 44.1
-or 48 kHz stream is resampled up to it. To feed outputs 3 and 4 with the same
-pair, add to `ldac96`'s ttable:
+or 48 kHz stream is resampled up to it.
 
-```
-ttable.0.2 1
-ttable.1.3 1
-```
+### Output map
+
+| Outputs | Carries | Level |
+| --- | --- | --- |
+| 1–2 | the stream **with** room correction — the speakers | the panel's slider |
+| 3–4 | the same stream **uncorrected**, for an external recorder | fixed at 0 dB |
+
+Outputs 3–4 are a flat tap deliberately taken ahead of the correction filter:
+the filter is tuned to one room and one pair of speakers, so baking it into a
+recording would be wrong. Both pairs come off the same converter at
+24-bit/96 kHz.
+
+The two pairs are **not time-aligned**. The correction is linear phase with its
+peak ~45.5 ms in, so outputs 1–2 lag 3–4 by that much. That is invisible to a
+separate recording; to line them up for an A/B, add a 45.5 ms `Delay` filter on
+channels 2 and 3 in `config/camilladsp-roomcorr.yaml`.
 
 **Volume.** The interface exposes a 128-step attenuator with a dB scale
-(`UMC404HD 192k Output`, 0 dB at 100%), and `bluealsa-aplay` runs with
-`--volume=mixer` so the sender's volume drives *that* instead of scaling
-samples. At full volume the decoded stream reaches the converter bit-perfect.
+(`UMC404HD 192k Output`, 0 dB at 100%) — and it turns out to have an
+*independent* attenuator per output. The panel's slider and mute therefore drive
+outputs 1–2 only, and `ldac-ctl` re-pins 3–4 to 0 dB after every change and at
+boot, because `alsa-restore` writes all four from its saved state. A recorder
+feed that moved with the listening volume would be useless.
+
+Two things still reach the tap, and neither can be fixed from the mixer:
+
+* In the default volume mode (`software`, panel owns the interface) the
+  connected device's own volume is applied **digitally**, upstream of
+  everything, so the tap follows the phone's volume slider. Keep the phone at
+  maximum for a full-scale recording.
+* In `mixer` mode (device owns the interface) BlueALSA writes all four channels
+  of the element on every remote volume change, so the pin only holds until the
+  device next moves its volume. Use the panel as the volume source if the tap
+  matters.
+
 For output that ignores the remote entirely, switch to `--volume=none` in
 `config/bluealsa-aplay.service.d-override.conf`.
 
 ## Room correction
 
 `Test900.wav` holds one impulse response per channel — 32768 taps at 96 kHz
-(341 ms), float32. CamillaDSP convolves each channel with its own response and
-then widens the result to the card's four channels.
+(341 ms), float32. CamillaDSP widens the stereo stream to the card's four
+channels *first*, then convolves outputs 1 and 2 with their own response and
+leaves 3 and 4 alone. That order is what makes the uncorrected recorder tap
+possible: correcting first would leave nothing clean to copy.
 
 **How the audio gets there.** This board's BSP kernel has no `snd-aloop`, so the
 usual ALSA-loopback route into CamillaDSP is not available. The
@@ -462,11 +489,15 @@ impulse convolved with a filter is that filter, so it pushes a unit impulse
 through the **installed** config — only the `devices:` block is swapped for file
 in / file out, everything below it is taken verbatim — and compares the result
 against the impulse response file tap by tap, then checks that outputs 3 and 4
-stay silent. It cannot pass while the live pipeline differs. Expect:
+give back a bare impulse — one sample, nothing else, which is a far stronger
+statement than "not silent": any filtering leaking onto the recorder tap would
+show up as a tail. It cannot pass while the live pipeline differs. Expect:
 
 ```
 channel 0: 32768 taps compared, worst error 4.66e-10 ... -> ok
 channel 1: 32768 taps compared, worst error 4.66e-10 ... -> ok
+channel 2: uncorrected tap, impulse 0.5000 at sample 0, rest 0 -> ok
+channel 3: uncorrected tap, impulse 0.5000 at sample 0, rest 0 -> ok
 convolution verified
 ```
 

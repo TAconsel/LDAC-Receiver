@@ -68,6 +68,13 @@ MIXER_CONTROL = os.environ.get("LDAC_MIXER_CONTROL", "UMC404HD 192k Output")
 # and mute is a separate button.
 VOLUME_FLOOR_DB = -80.0
 
+# The element has one attenuator per output, and outputs 3-4 are the recorder
+# tap: a tap whose level moved with the listening volume would be useless, so
+# the slider and the mute drive only the speaker pair and the tap is held at
+# unity.  amixer takes these names as the channel argument to sset.
+SPEAKER_CHANNELS = ("frontleft", "frontright")
+TAP_CHANNELS = ("rearleft", "rearright")
+
 # Who drives that control, as bluealsa-aplay's --volume argument.  "mixer" hands
 # it to the connected device; "software" keeps it for the panel and applies the
 # device's volume digitally instead.
@@ -454,8 +461,9 @@ def card_state():
 def volume_state():
     """The interface's hardware output level.
 
-    Read from the first playback channel; the element covers all four outputs
-    and they are always set together.
+    Read from the front-left playback channel, which is the speaker pair.  The
+    element also carries outputs 3-4, but those are the recorder tap and are
+    held separately at unity, so they are reported separately too.
     """
     mode = read_defaults().get("LDAC_VOLUME_MODE", VOLUME_MODE_PANEL)
     source = "device" if mode == VOLUME_MODE_DEVICE else "panel"
@@ -464,11 +472,16 @@ def volume_state():
     if rc != 0:
         return {"available": False, "source": source,
                 "error": "no '%s' control on card %s" % (MIXER_CONTROL, CARD)}
+    levels = {name: float(db) for name, db in re.findall(
+        r"^\s*(Rear Left|Rear Right):"
+        r" Playback \d+ \[\d+%\] \[(-?[\d.]+)dB\] \[(?:on|off)\]",
+        out, re.M)}
     m = re.search(r"Playback (\d+) \[(\d+)%\] \[(-?[\d.]+)dB\] \[(on|off)\]", out)
     if not m:
         # Some controls have no dB scale; without one a dB slider is meaningless.
         return {"available": False, "source": source,
                 "error": "control has no dB scale"}
+    tap = list(levels.values())
     return {
         "available": True,
         "control": MIXER_CONTROL,
@@ -478,6 +491,9 @@ def volume_state():
         "muted": m.group(4) == "off",
         "floor_db": VOLUME_FLOOR_DB,
         "source": source,
+        # Outputs 3-4.  Anything but 0.0 means something moved the whole element
+        # behind our back — see pin_tap_channels().
+        "tap_db": max(tap) if tap else None,
     }
 
 
@@ -506,6 +522,27 @@ def store_mixer():
     return rc == 0
 
 
+def pin_tap_channels():
+    """Put outputs 3-4 back to unity and unmuted.
+
+    Called after every change to this element, and at boot.  Two things reset
+    it: `alsactl restore`, which writes whatever was last stored, and
+    bluealsa-aplay in mixer mode, which sets the element with ALSA's
+    "all channels" call every time the connected device moves its own volume.
+    Neither knows outputs 3-4 are a recorder tap.
+
+    In mixer mode this therefore only holds until the device's next volume
+    change — the tap follows the phone until the panel is touched again.  Use
+    the panel as the volume source (the default) to keep the tap fixed.
+    """
+    ok = True
+    for ch in TAP_CHANNELS:
+        rc, _ = run(["amixer", "-c", CARD, "-q", "--", "sset", MIXER_CONTROL,
+                     ch, "0dB", "unmute"])
+        ok = ok and rc == 0
+    return ok
+
+
 def cmd_volume(action, value):
     if action == "source":
         if value not in ("panel", "device"):
@@ -521,10 +558,13 @@ def cmd_volume(action, value):
 
     if action == "mute":
         on = want_on(value)
-        rc, _ = run(["amixer", "-c", CARD, "-q", "sset", MIXER_CONTROL,
-                     "off" if on else "on"])
-        if rc != 0:
-            fail("could not change mute")
+        # Speakers only: muting the room should not cut the recording.
+        for ch in SPEAKER_CHANNELS:
+            rc, _ = run(["amixer", "-c", CARD, "-q", "sset", MIXER_CONTROL,
+                         ch, "off" if on else "on"])
+            if rc != 0:
+                fail("could not change mute")
+        pin_tap_channels()
         return {"ok": True, "persisted": store_mixer(), "volume": volume_state()}
 
     if action != "set":
@@ -538,11 +578,14 @@ def cmd_volume(action, value):
         fail("volume must be a real number of dB")
     # Never above unity: this is an attenuator, and the card would clamp anyway.
     db = max(-127.0, min(0.0, db))
+    # Outputs 1-2 only; 3-4 are the recorder tap and stay at unity.
     # `--` so a negative value is not taken for an option.
-    rc, _ = run(["amixer", "-c", CARD, "-q", "--", "sset", MIXER_CONTROL,
-                 "%.0fdB" % db])
-    if rc != 0:
-        fail("could not set volume")
+    for ch in SPEAKER_CHANNELS:
+        rc, _ = run(["amixer", "-c", CARD, "-q", "--", "sset", MIXER_CONTROL,
+                     ch, "%.0fdB" % db])
+        if rc != 0:
+            fail("could not set volume")
+    pin_tap_channels()
     # Reported rather than swallowed: if this is false the level is live but
     # will not survive a reboot, which is worth knowing.
     return {"ok": True, "persisted": store_mixer(), "volume": volume_state()}
@@ -670,6 +713,10 @@ def cmd_apply_boot():
     run(["hciconfig", "hci0", "lp", "rswitch"])
     discoverable = values.get("LDAC_DISCOVERABLE", "on")
     run(["btmgmt", "discov", "on" if discoverable == "on" else "off"])
+
+    # alsa-restore has just written all four output attenuators from its saved
+    # state, which does not know outputs 3-4 are a recorder tap.  Put them back.
+    pin_tap_channels()
     return {"ok": True, "adapter": adapter_state()}
 
 

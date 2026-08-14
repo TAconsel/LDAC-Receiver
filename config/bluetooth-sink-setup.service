@@ -13,6 +13,10 @@
 Description=Restore Bluetooth adapter state for the A2DP sink
 After=bluetooth.service
 Requires=bluetooth.service
+# apply-boot also re-pins the recorder tap (outputs 3-4) to unity, which
+# alsa-restore would otherwise overwrite from its saved state a moment later.
+# Ordering only: if alsa-restore is absent or fails there is nothing to undo.
+After=alsa-restore.service
 
 [Service]
 Type=oneshot

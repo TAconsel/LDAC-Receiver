@@ -165,7 +165,7 @@
   </section>
 
   <section>
-    <h2>Output level</h2>
+    <h2>Speaker level</h2>
     <div class="row">
       <div class="grow">
         <div class="vol-read" id="voldb">—</div>
@@ -174,7 +174,7 @@
       <button id="mute" disabled>Mute</button>
     </div>
     <input type="range" id="vol" min="-80" max="0" step="1" value="0" disabled
-           aria-label="Output level in decibels">
+           aria-label="Speaker level in decibels">
     <div class="scale"><span id="volmin">−80 dB</span><span>0 dB</span></div>
     <div class="row">
       <div class="grow">
@@ -380,7 +380,8 @@ function renderVolume(v) {
   src.disabled = busy || !v;
   $('srchint').textContent = byDevice
     ? 'Its volume drives the interface directly, so nothing scales the audio — '
-      + 'but it overwrites the slider whenever it changes.'
+      + 'but it overwrites the slider whenever it changes, and pulls the '
+      + 'recorder tap down with it.'
     : 'The slider owns the interface level; the device\'s volume is applied '
       + 'digitally instead, so the two never fight.';
 
@@ -397,9 +398,14 @@ function renderVolume(v) {
   mute.disabled = false;
   mute.textContent = v.muted ? 'Unmute' : 'Mute';
   mute.dataset.muted = v.muted ? '1' : '0';
-  $('volhint').textContent = v.muted
-    ? `${v.control} — muted`
-    : `${v.control} — step ${v.raw} of 127`;
+  // Outputs 3-4 are the uncorrected recorder tap and should sit at unity; say
+  // so when they do not, since only something outside the panel can move them.
+  const tap = v.tap_db === 0 ? 'outputs 3-4 at 0 dB'
+    : v.tap_db == null ? '' : `outputs 3-4 at ${v.tap_db} dB`;
+  $('volhint').textContent = (v.muted
+    ? `${v.control} — outputs 1-2 muted`
+    : `${v.control} — outputs 1-2 at step ${v.raw} of 127`)
+    + (tap ? `, ${tap}` : '');
   if (!dragging && Date.now() > volSettleUntil) {
     slider.value = Math.max(Number(v.floor_db), v.db);
     showVolume(v.db, v.muted);

@@ -8,11 +8,25 @@
 # below — the filter is designed for 96 kHz and must not run at anything else.
 #
 # Signal path:
-#   stdin (2ch from bluealsa-aplay) -> per-channel convolution -> mixer -> 4ch out
+#   stdin (2ch from bluealsa-aplay) -> mixer widens to 4ch -> convolution on
+#   channels 1 and 2 only -> 4ch out
 #
-# The UMC404HD is a fixed 4-channel device, so the mixer widens stereo to its
-# 4 channels and leaves outputs 3 and 4 silent.  Its 24-bit samples ride in
+# The UMC404HD is a fixed 4-channel device.  The mixer copies the stereo pair
+# to both output pairs, and the correction is applied *after* it to outputs 1
+# and 2 alone, so:
+#
+#   outputs 1-2  corrected — the speakers
+#   outputs 3-4  the same audio uncorrected, at unity — a tap for an external
+#                recorder
+#
+# The order matters and is the whole point: widening first is what makes an
+# untouched copy available to filter selectively.  Its 24-bit samples ride in
 # 32-bit containers, hence S32LE at 96000.
+#
+# The two pairs are not time-aligned.  The correction is linear phase with its
+# peak ~45.5 ms in, so outputs 1-2 lag 3-4 by that much.  For a separate
+# recording that does not matter; to align them for A/B, put a
+# `Delay` filter of 45.5 ms on channels 2 and 3 in the pipeline below.
 
 devices:
   samplerate: 96000
@@ -69,16 +83,26 @@ mixers:
         sources:
           - channel: 1
             gain: 0
-      # Outputs 3 and 4 exist only because the card demands 4 channels; no
-      # source is mapped to them, so they stay silent.  To mirror the pair,
-      # add dest 2 from channel 0 and dest 3 from channel 1.
+      # Outputs 3 and 4 get the same pair, and nothing downstream filters them.
+      # To silence the recorder tap again, delete these two entries — the
+      # pipeline needs no other change.
+      - dest: 2
+        sources:
+          - channel: 0
+            gain: 0
+      - dest: 3
+        sources:
+          - channel: 1
+            gain: 0
 
 pipeline:
+  # Widen to 4 channels first, then correct only the speaker pair.  Outputs 3
+  # and 4 pass through from here untouched.
+  - type: Mixer
+    name: stereo_to_umc404hd
   - type: Filter
     channels: [0]
     names: [roomcorr_left]
   - type: Filter
     channels: [1]
     names: [roomcorr_right]
-  - type: Mixer
-    name: stereo_to_umc404hd

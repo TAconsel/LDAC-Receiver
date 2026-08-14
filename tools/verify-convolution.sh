@@ -5,7 +5,8 @@
 # An impulse convolved with a filter is the filter, so this feeds a unit impulse
 # through the same filters/mixers/pipeline the live path uses and compares the
 # result sample by sample against the impulse response file itself. It also
-# checks the mixer, by confirming outputs 3 and 4 stay silent.
+# checks the mixer, by confirming outputs 3 and 4 carry the *unfiltered*
+# impulse — the recorder tap — rather than a corrected or silent one.
 #
 # Only the `devices:` block is swapped, for file in / file out — everything
 # below it is taken verbatim from the installed config, so this cannot pass
@@ -124,10 +125,17 @@ for c in (0, 1):
     if not ok:
         fail = 1
 
+# Outputs 3-4 are the uncorrected recorder tap, so an impulse in must give an
+# impulse straight back out: one sample at 0.5 full scale and nothing else.
+# A single non-zero sample is a much stronger check than "not silent" — if any
+# filtering had leaked onto these channels the tail would show up here.
 for c in (2, 3):
-    mx = max(abs(v) for v in out[c])
-    ok = mx == 0
-    print('channel %d: silent (max |sample| = %d) -> %s' % (c, mx, 'ok' if ok else 'FAIL'))
+    peak = max(range(len(out[c])), key=lambda k: abs(out[c][k]))
+    amp = out[c][peak] / 2**31
+    rest = max((abs(v) for k, v in enumerate(out[c]) if k != peak), default=0)
+    ok = abs(amp - 0.5) < 1e-6 and rest == 0
+    print('channel %d: uncorrected tap, impulse %.4f at sample %d, '
+          'rest %d -> %s' % (c, amp, peak, rest, 'ok' if ok else 'FAIL'))
     if not ok:
         fail = 1
 
