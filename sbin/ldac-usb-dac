@@ -49,26 +49,35 @@ CHUNKSIZE="${CHUNKSIZE:-2048}"
 # still fits inside the card's 8192 frame buffer.
 TARGET_LEVEL="${TARGET_LEVEL:-4096}"
 
+# Chunks allowed to sit between the capture and playback threads.  1 is the
+# lowest latency and leaves the playback thread nothing to fall back on when it
+# is late; CamillaDSP's own default is 4, which is ~85 ms of slack here and the
+# difference between riding over a scheduling hiccup and clicking.
+QUEUELIMIT="${QUEUELIMIT:-4}"
+
 die() { echo "ldac-usb-dac: $*" >&2; exit 1; }
 
-# Whether CamillaDSP has to do the clock matching, which depends on which
-# endpoint sync type the gadget actually bound with.
+# How the drift between the host's clock and the interface's gets corrected.
+# Three cases, probed rather than assumed, in order of preference:
 #
-#   async     the gadget reports its real consumption on a feedback endpoint and
-#             the host follows.  The clock loop already exists in hardware, and
-#             it is closed through *us*: we drain at the interface's rate,
-#             u_audio measures that, the host adjusts.  A second loop here would
-#             fight it, so rate adjustment stays off.
-#   adaptive  no feedback endpoint, so the host free-runs at its own idea of the
-#             rate and the drift has to be absorbed here.
-#
-# ldac-usb-gadget asks for async and settles for adaptive, so this is read from
-# the bound gadget rather than assumed.
-rate_adjust_needed() {
-	local sync
-	sync=$(cat /sys/kernel/config/usb_gadget/ldacrx/functions/uac2.usb0/c_sync \
-		2>/dev/null) || return 0
-	[[ $sync != async ]]
+#   pitch     u_audio gives the gadget capture device a "Capture Pitch 1000000"
+#             ALSA control, and CamillaDSP drives it when enable_rate_adjust is
+#             on: it watches its own buffer level and asks the *host* to send
+#             slightly faster or slower.  Nothing is resampled -- the correction
+#             happens at the source, which is the whole point of an async DAC.
+#   none      async endpoint but no pitch control: u_audio's own feedback is the
+#             only loop, and a second one here would fight it.
+#   resample  adaptive endpoint and no pitch control: the host free-runs, so the
+#             drift has to be absorbed by an async resampler here.
+drift_mode() {
+	if amixer -c "$GADGET_CARD" controls 2>/dev/null | grep -q "Capture Pitch"; then
+		echo pitch
+	elif [[ $(cat /sys/kernel/config/usb_gadget/ldacrx/functions/uac2.usb0/c_sync \
+		2>/dev/null) == async ]]; then
+		echo none
+	else
+		echo resample
+	fi
 }
 
 corrected() {
@@ -81,15 +90,31 @@ corrected() {
 write_config() {
 	mkdir -p "$(dirname "$OUT")"
 
-	# Emitted into both configs below.  With async there is nothing to correct
-	# here, and saying so in the file makes the running config self-explaining.
-	if rate_adjust_needed; then
+	# Emitted into both configs below, so the running file explains itself.
+	case "$(drift_mode)" in
+	pitch)
+		RATE_ADJUST_BLOCK=$(cat <<'YAML'
+  # The gadget capture device has a "Capture Pitch 1000000" control, so drift is
+  # corrected by asking the host to change rate -- nothing is resampled. Watch
+  # it work with: amixer -c UAC2Gadget cget numid=1
+  enable_rate_adjust: true
+  adjust_period: 10
+YAML
+		)
+		;;
+	none)
+		RATE_ADJUST_BLOCK=$(cat <<'YAML'
+  # Async endpoint and no pitch control: the hardware feedback loop is already
+  # closed through this process, and a second one here would fight it.
+  enable_rate_adjust: false
+YAML
+		)
+		;;
+	*)
 		RATE_ADJUST_BLOCK=$(cat <<YAML
-  # The gadget bound as 'adaptive': no feedback endpoint, so the host free-runs
-  # at its own idea of $RATE Hz while the UMC404HD consumes at its own. Tens of
-  # ppm between the two crystals would empty or overflow the buffer every few
-  # minutes and click. Watch the capture buffer level and trim the resampling
-  # ratio to match -- the job an asynchronous USB DAC does in hardware.
+  # Adaptive endpoint and no pitch control: the host free-runs at its own idea
+  # of $RATE Hz while the UMC404HD consumes at its own, so the tens of ppm
+  # between the two crystals has to be absorbed here.
   enable_rate_adjust: true
   adjust_period: 10
   resampler:
@@ -97,16 +122,8 @@ write_config() {
     profile: Balanced
 YAML
 		)
-	else
-		RATE_ADJUST_BLOCK=$(cat <<'YAML'
-  # The gadget bound as 'async': it reports our real consumption on a feedback
-  # endpoint and the host follows, so the clock loop already exists and is
-  # closed through this process. A second loop here would fight it, so the
-  # samples reach the interface unresampled.
-  enable_rate_adjust: false
-YAML
-		)
-	fi
+		;;
+	esac
 
 	if ! corrected; then
 		cat > "$OUT" <<-EOF
@@ -118,7 +135,7 @@ YAML
 		  capture_samplerate: $RATE
 		  chunksize: $CHUNKSIZE
 		  target_level: $TARGET_LEVEL
-		  queuelimit: 1
+		  queuelimit: $QUEUELIMIT
 $RATE_ADJUST_BLOCK
 		  capture:
 		    type: Alsa
@@ -145,7 +162,7 @@ $RATE_ADJUST_BLOCK
 		  capture_samplerate: $RATE
 		  chunksize: $CHUNKSIZE
 		  target_level: $TARGET_LEVEL
-		  queuelimit: 1
+		  queuelimit: $QUEUELIMIT
 $RATE_ADJUST_BLOCK
 		  capture:
 		    type: Alsa

@@ -32,3 +32,13 @@ RestartSec=2
 # not turn a restart into 90 s of silence.
 TimeoutStopSec=10
 Nice=-10
+# CamillaDSP asks for SCHED_FIFO on its processing, capture and playback
+# threads, and silently settles for SCHED_OTHER when it cannot have it -- there
+# is no warning in the log, the threads just come up at priority 0.  Nice=-10
+# is not a substitute: it biases the fair scheduler but still lets any runnable
+# task delay the playback thread past the card's 85 ms buffer, which is heard as
+# a click every minute or two.  The gadget's capture buffer cannot be made
+# bigger (u_audio caps it at 8192 frames), so meeting the deadline is the only
+# option left.
+LimitRTPRIO=99
+LimitMEMLOCK=infinity

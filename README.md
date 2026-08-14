@@ -389,18 +389,40 @@ on. Async needs a feedback IN endpoint beside the isochronous OUT one:
   `f_uac2` fails its bind with `afunc_bind:1171 Error!` and `-ENODEV`, and also
   refuses both directions at once, failing at `:1182`.
 
-`ldac-usb-dac` reads the sync type the gadget actually bound with and sets
-`enable_rate_adjust` accordingly: **off** for async, since a second control loop
-would fight the hardware one and the samples then reach the interface
-unresampled; **on**, with an `AsyncSinc` resampler, for adaptive, where the host
-free-runs and the tens of ppm between the two crystals would otherwise empty or
-overflow the buffer every few minutes and click.
+**Drift is corrected without resampling.** `u_audio` gives the gadget capture
+device a `Capture Pitch 1000000` ALSA control (numid 1, range 750000–1005000),
+and CamillaDSP drives it when `enable_rate_adjust` is on — it watches its own
+buffer level and asks the *host* to send slightly faster or slower, which is
+what the feedback endpoint is for. Nothing is resampled: the correction happens
+at the source. CamillaDSP confirms it at startup with `Capture device supports
+rate adjust`, and you can watch it work:
+
+```sh
+amixer -c UAC2Gadget cget numid=1      # 1000000 = exactly nominal
+```
+
+`ldac-usb-dac` probes for that control and picks one of three modes, rather than
+assuming: **pitch** (the above), **none** (async but no pitch control — the
+hardware loop is the only one, and a second would fight it), or **resample**
+(adaptive and no pitch control — an `AsyncSinc` resampler absorbs the drift
+here, the only case where anything is resampled).
 
 The gadget's capture buffer is fixed at **8192 frames with a 512 frame period**
 regardless of controller (u_audio's constraint; `prealloc_max` is 64 KB and
 writing it changes nothing), so the USB path uses `chunksize: 2048` rather than
 the Bluetooth path's 4096, with `target_level: 4096` so the first seconds of a
 stream have something to absorb the host's feedback loop settling.
+
+Two settings exist because the gadget's buffer is small and the deadline is
+tight: `queuelimit: 4` (CamillaDSP's default; `1` is the lowest latency but
+leaves the playback thread nothing to fall back on when it is late), and
+`LimitRTPRIO=99` on the unit. CamillaDSP asks for `SCHED_FIFO` on its
+processing, capture and playback threads through rtkit and **settles for
+`SCHED_OTHER` without warning** when the limit forbids it — `Nice=-10` is not a
+substitute, since it only biases the fair scheduler. Confirm with
+`camilladsp … -l debug`, which prints `… thread has real-time priority`; note
+that CamillaDSP drops the threads back to normal while the capture is stalled,
+so checking `chrt` on an idle player is misleading.
 
 Measured: a 90 s stream from a PipeWire host runs with **no underruns at all**
 once settled, CamillaDSP at ~10% of one core. Starting a stream after silence
