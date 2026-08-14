@@ -22,3 +22,13 @@ LDAC_DISCOVERABLE=on
 #              Nothing then scales the samples anywhere, but the device will
 #              overwrite whatever the slider was set to.
 LDAC_VOLUME_MODE=software
+
+# Which input feeds the interface:
+#   bluetooth - A2DP from a phone or computer, via bluealsa-aplay (default)
+#   usb       - the USB Audio Class gadget, via ldac-usb-dac
+#
+# These are alternatives, not a mix: CamillaDSP opens the interface
+# exclusively, so only one player can hold it. Switching stops the other one,
+# which interrupts whatever was playing. Room correction (LDAC_PCM above)
+# applies to both.
+LDAC_SOURCE=bluetooth

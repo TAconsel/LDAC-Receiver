@@ -98,6 +98,18 @@
   button:disabled { opacity: .45; cursor: default; }
   button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
 
+  /* input selector: two mutually exclusive choices, so a segmented pair rather
+     than a switch — a switch would imply one of them is "off". */
+  .seg { display: flex; gap: 0; flex: none; }
+  .seg button { border-radius: 0; margin: 0; }
+  .seg button:first-child { border-radius: 8px 0 0 8px; }
+  .seg button:last-child { border-radius: 0 8px 8px 0; margin-left: -1px; }
+  .seg button.on {
+    border-color: var(--accent); color: var(--bg); background: var(--accent);
+    position: relative; z-index: 1;
+  }
+  .seg button.on:hover:not(:disabled) { color: var(--bg); }
+
   /* volume */
   .vol-read { font-size: 1.5rem; font-weight: 650; font-variant-numeric: tabular-nums;
               letter-spacing: -0.02em; }
@@ -152,6 +164,16 @@
 
   <section>
     <h2>Audio</h2>
+    <div class="row">
+      <div class="grow">
+        <div class="label">Input</div>
+        <div class="hint" id="srcstate">—</div>
+      </div>
+      <div class="seg" id="srcseg">
+        <button data-source="bluetooth" disabled>Bluetooth</button>
+        <button data-source="usb" disabled>USB</button>
+      </div>
+    </div>
     <div class="row">
       <div class="grow">
         <div class="label">Room correction</div>
@@ -362,6 +384,18 @@ $('mute').addEventListener('click', () => {
   }), null);
 });
 
+document.querySelectorAll('#srcseg button').forEach((b) => {
+  b.addEventListener('click', () => {
+    const source = b.dataset.source;
+    // The interface can only be opened by one of them, so this stops the other
+    // player. Anything currently playing on the old input stops.
+    act(() => api('/api/source', {
+      method: 'POST', body: JSON.stringify({ source }),
+    }), source === 'usb' ? 'USB is now the input — Bluetooth playback is stopped'
+                         : 'Bluetooth is now the input — USB playback is stopped');
+  });
+});
+
 $('volsrc').addEventListener('change', (e) => {
   const toDevice = e.target.checked;
   act(() => api('/api/volume', {
@@ -412,11 +446,33 @@ function renderVolume(v) {
   }
 }
 
+function renderSource(s) {
+  const source = s.source || 'bluetooth';
+  const usb = s.usb || {};
+  document.querySelectorAll('#srcseg button').forEach((b) => {
+    b.classList.toggle('on', b.dataset.source === source);
+    b.disabled = busy;
+  });
+  if (source === 'usb') {
+    // The distinction that matters when nothing plays: the gadget always
+    // exists, but only a host session means a computer is actually there.
+    $('srcstate').textContent = usb.host
+      ? 'A computer is connected over USB'
+      : (usb.gadget
+        ? 'Waiting for a computer — nothing on the USB-C port yet'
+        : 'USB gadget not set up');
+  } else {
+    $('srcstate').textContent = 'Bluetooth audio plays; the USB input is idle';
+  }
+}
+
 function render(s) {
   const a = s.adapter || {};
   $('devname').textContent = a.name || 'LDAC Receiver';
   $('devsub').textContent = [a.address, a.powered ? 'powered' : 'off']
     .filter(Boolean).join(' · ');
+
+  renderSource(s);
 
   const c = s.convolution || {};
   $('conv').checked = !!c.enabled;

@@ -6,3 +6,5 @@ build/
 ldacBT-dec.pc
 tests/test-decode
 tests/test-ldacbt-dec
+__pycache__/
+*.pyc

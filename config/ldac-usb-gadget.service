@@ -1,0 +1,30 @@
+# Installed as /etc/systemd/system/ldac-usb-gadget.service
+#
+# Builds the USB Audio Class 2 gadget so a computer on the OTG port sees the
+# board as a 24-bit/96 kHz stereo sound card.  This only creates the gadget and
+# binds it to the device controller; it does not touch audio.  ldac-usb-dac
+# does that, once a host actually shows up.
+#
+# The gadget is built once at boot and left bound.  Binding costs nothing while
+# no host is attached -- the controller simply sits in the "not attached" state
+# -- and leaving it up means plugging the cable in is enough, with no service to
+# start by hand.
+#
+# Not ordered after sound: the gadget's own ALSA card is created by binding, and
+# nothing here opens the interface.
+
+[Unit]
+Description=USB Audio Class gadget for the LDAC receiver
+# configfs has to be mounted before the gadget can be described.
+After=sys-kernel-config.mount
+Requires=sys-kernel-config.mount
+Before=ldac-usb-dac.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ldac-usb-gadget up
+ExecStop=/usr/local/sbin/ldac-usb-gadget down
+
+[Install]
+WantedBy=multi-user.target

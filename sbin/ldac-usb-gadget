@@ -1,0 +1,162 @@
+#!/bin/bash
+# Present the board to a USB host as a 24-bit/96 kHz stereo speaker.
+#
+#   ldac-usb-gadget up|down|status
+#
+# This is the USB Audio Class 2 *gadget* side: the board stops being only a
+# Bluetooth sink and also becomes a plain USB DAC, so a computer on the OTG port
+# sees a sound card and plays into the same room correction and the same
+# interface.
+#
+# Direction, which is the one thing that is easy to get backwards: f_uac2's
+# `p_` (playback) and `c_` (capture) attributes are named from the *gadget's*
+# point of view, not the host's.  `p_chmask` gives the gadget a playback stream
+# that feeds the IN endpoint, which makes it a microphone to the host.  A DAC
+# is the other one: `c_chmask` gives the gadget a capture stream fed by the OUT
+# endpoint, so the host sees a speaker and we read what it sends.  The board
+# then gets an ALSA *capture* device (pcm0c on card UAC2Gadget).
+#
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+
+GADGET_NAME="${GADGET_NAME:-ldacrx}"
+CONFIGFS=/sys/kernel/config/usb_gadget
+G="$CONFIGFS/$GADGET_NAME"
+
+# Stereo, 96 kHz, 4-byte samples.  Four bytes is S32_LE, which is the same
+# 24-bit-in-32-bit container the UMC404HD and CamillaDSP already use, so audio
+# crosses from USB to the DSP with no format conversion anywhere.  At 768 kB/s
+# it is a rounding error on a 480 Mbit/s high-speed link.
+SRATE="${USB_GADGET_RATE:-96000}"
+SSIZE="${USB_GADGET_SSIZE:-4}"
+CHMASK="${USB_GADGET_CHMASK:-3}"        # front left + front right
+
+# Endpoint sync type.  `async` would be the better answer -- the gadget tells
+# the host how fast it is really consuming and the host follows, which is what
+# a good asynchronous USB DAC does, and it matters here because the sample clock
+# that counts belongs to the UMC404HD rather than to the PC.
+#
+# This board cannot do it.  Async needs a second, feedback IN endpoint beside
+# the isochronous OUT one, and sunxi_usb_udc has no endpoint left to give:
+# f_uac2 fails its bind with `afunc_bind:1171 Error!` and -ENODEV.  (The same
+# controller also refuses both directions at once, failing at :1182.)  So the
+# host free-runs at its own idea of 96 kHz, and the drift against the
+# interface's clock is absorbed downstream instead, by CamillaDSP's rate
+# adjustment -- see config/camilladsp-usb.yaml.  Do not "fix" this back to
+# async without checking that bind still succeeds.
+SYNC="${USB_GADGET_SYNC:-adaptive}"
+# Number of USB requests queued at once.  The default of 2 leaves no slack for a
+# board that is also decoding LDAC; 4 costs a few hundred microseconds of
+# latency and rides over scheduling jitter.
+REQ_NUMBER="${USB_GADGET_REQ_NUMBER:-4}"
+
+VID="${USB_GADGET_VID:-0x1d6b}"         # Linux Foundation
+PID="${USB_GADGET_PID:-0x0101}"         # Audio gadget
+MANUFACTURER="${USB_GADGET_MANUFACTURER:-Radxa}"
+PRODUCT="${USB_GADGET_PRODUCT:-LDAC Receiver}"
+SERIAL="${USB_GADGET_SERIAL:-0001}"
+
+die() { echo "ldac-usb-gadget: $*" >&2; exit 1; }
+
+udc_name() {
+	# There is exactly one device controller on this board, and it belongs to
+	# the USB-C port that also takes power.  Empty means the kernel has no
+	# gadget-capable controller bound, which is a different failure from the
+	# host simply not being plugged in.
+	local u
+	u=$(ls /sys/class/udc 2>/dev/null | head -1) || true
+	echo "$u"
+}
+
+gadget_down() {
+	[[ -d $G ]] || return 0
+	# Unbind first: nothing below can be dismantled while a host session or a
+	# UDC binding is holding the function open.
+	if [[ -e $G/UDC && -s $G/UDC ]]; then
+		echo "" > "$G/UDC" 2>/dev/null || true
+		sleep 0.5
+	fi
+	# Links before directories, deepest first; configfs refuses rmdir on
+	# anything still referenced.
+	find "$G/configs" -maxdepth 2 -type l -delete 2>/dev/null || true
+	for d in "$G"/configs/*/strings/*; do [[ -d $d ]] && rmdir "$d"; done
+	for d in "$G"/configs/*; do [[ -d $d ]] && rmdir "$d"; done
+	for d in "$G"/functions/*; do [[ -d $d ]] && rmdir "$d"; done
+	for d in "$G"/strings/*; do [[ -d $d ]] && rmdir "$d"; done
+	rmdir "$G"
+}
+
+gadget_up() {
+	modprobe libcomposite 2>/dev/null || true
+	[[ -d $CONFIGFS ]] || die "no $CONFIGFS — kernel has no USB gadget configfs support"
+
+	local udc
+	udc=$(udc_name)
+	[[ -n $udc ]] || die "no UDC in /sys/class/udc — no gadget-capable USB controller"
+
+	# Idempotent: rebuilding from scratch is the only reliable way to change
+	# the audio parameters, because configfs refuses attribute writes on a
+	# function that is already linked into a config.
+	gadget_down
+
+	mkdir -p "$G"
+	cd "$G"
+	echo "$VID" > idVendor
+	echo "$PID" > idProduct
+	echo 0x0100 > bcdDevice
+	echo 0x0200 > bcdUSB
+	mkdir -p strings/0x409
+	echo "$SERIAL"       > strings/0x409/serialnumber
+	echo "$MANUFACTURER" > strings/0x409/manufacturer
+	echo "$PRODUCT"      > strings/0x409/product
+
+	mkdir -p functions/uac2.usb0
+	local f=functions/uac2.usb0
+	# Gadget capture = host playback.  See the direction note at the top.
+	echo "$CHMASK" > "$f/c_chmask"
+	echo "$SRATE"  > "$f/c_srate"
+	echo "$SSIZE"  > "$f/c_ssize"
+	# No gadget playback: this is a DAC, so the host gets a speaker and no
+	# phantom microphone it might pick by accident as a recording source.
+	echo 0 > "$f/p_chmask"
+	echo "$SYNC"       > "$f/c_sync"       2>/dev/null || true
+	echo "$REQ_NUMBER" > "$f/req_number"   2>/dev/null || true
+	# Leave volume and mute out of the descriptors: with them the host's
+	# volume slider maps to a control that nothing in this path applies, so it
+	# would look connected and do nothing.  The host does its own software
+	# volume instead, and the panel's slider still owns the interface.
+	echo 0 > "$f/c_volume_present" 2>/dev/null || true
+	echo 0 > "$f/c_mute_present"   2>/dev/null || true
+
+	mkdir -p configs/c.1/strings/0x409
+	echo "UAC2 audio" > configs/c.1/strings/0x409/configuration
+	echo 250 > configs/c.1/MaxPower
+	ln -s functions/uac2.usb0 configs/c.1/
+
+	echo "$udc" > UDC
+}
+
+case "${1:-}" in
+up)     gadget_up ;;
+down)   gadget_down ;;
+status)
+	if [[ ! -d $G ]]; then
+		echo "gadget: absent"
+	else
+		echo "gadget: present ($GADGET_NAME)"
+		echo "bound to UDC: $(cat "$G/UDC" 2>/dev/null || true)"
+		for a in c_chmask c_srate c_ssize c_sync req_number; do
+			printf '  %-12s %s\n' "$a" \
+				"$(cat "$G/functions/uac2.usb0/$a" 2>/dev/null || echo -)"
+		done
+	fi
+	# "configured" means a host has enumerated and selected a configuration;
+	# "not attached" means no host session, which on this board most often
+	# means the cable is in the other USB-C port.
+	for s in /sys/class/udc/*/state; do
+		[[ -e $s ]] && echo "udc state: $(cat "$s")"
+	done
+	;;
+*)      die "usage: ldac-usb-gadget up|down|status" ;;
+esac

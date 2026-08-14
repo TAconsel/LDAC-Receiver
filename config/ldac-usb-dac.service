@@ -1,0 +1,34 @@
+# Installed as /etc/systemd/system/ldac-usb-dac.service
+#
+# Plays what the USB host sends through the room correction and out of the
+# UMC404HD, exactly as the Bluetooth path does -- the filters come from the same
+# /etc/camilladsp/roomcorr.yaml, lifted at start time rather than copied.
+#
+# This service and bluealsa-aplay are alternatives, never both: CamillaDSP opens
+# the interface exclusively, so whichever gets there first locks the other out
+# with "Device or resource busy".  ldac-ctl's `source` verb is what switches
+# between them, and it stops one before starting the other.  Conflicts= makes
+# systemd enforce that even if something starts this unit directly.
+#
+# The script waits for the device controller to report `configured` before
+# starting CamillaDSP, so with no host plugged in this unit sits idle instead of
+# holding the interface hostage against a stream that will never arrive.
+
+[Unit]
+Description=USB DAC playback for the LDAC receiver
+After=ldac-usb-gadget.service
+Requires=ldac-usb-gadget.service
+Conflicts=bluealsa-aplay.service
+
+[Service]
+Type=simple
+RuntimeDirectory=camilladsp
+ExecStart=/usr/local/sbin/ldac-usb-dac run
+# CamillaDSP exits when the host stops streaming and the capture device drops
+# out from under it.  That is normal, not a failure: restart and wait again.
+Restart=always
+RestartSec=2
+# Same reason as bluealsa-aplay: a wedged CamillaDSP that ignores SIGTERM must
+# not turn a restart into 90 s of silence.
+TimeoutStopSec=10
+Nice=-10

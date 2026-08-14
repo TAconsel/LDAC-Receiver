@@ -132,6 +132,18 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, await ctl([verb, state]));
   }
 
+  if (url.pathname === '/api/source') {
+    // Whitelisted here as well as in ldac-ctl: this decides which player owns
+    // the sound card, so an unexpected value should be a 400 rather than
+    // something the privileged script has to reason about.
+    if (body.source !== 'bluetooth' && body.source !== 'usb') {
+      return sendJson(res, 400, {
+        ok: false, error: '"source" must be "bluetooth" or "usb"',
+      });
+    }
+    return sendJson(res, 200, await ctl(['source', body.source]));
+  }
+
   if (url.pathname === '/api/volume') {
     // Source, mute and level are separate requests; a body with several would
     // be ambiguous about which one was meant.

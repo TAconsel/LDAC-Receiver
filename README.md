@@ -2,16 +2,24 @@
 
 Turns the board into an A2DP **sink** that accepts LDAC, applies FIR room
 correction, and plays the result out of a USB audio interface at
-**24-bit / 96 kHz**.
+**24-bit / 96 kHz**. It is also a **USB DAC**: a computer on the OTG port sees
+a 24-bit/96 kHz sound card and gets the same correction.
 
 Verified on a Radxa Cubie A7S (Allwinner A733, Debian 11 bullseye, aarch64,
 BlueZ 5.55, AIC8800D80 Bluetooth) with a Behringer UMC404HD, receiving from a
 PipeWire 1.6.2 sender.
 
 ```
-sender ──LDAC/A2DP──▶ bluealsad ──▶ libldacBT_dec ──▶ ALSA "dsp96" ──▶ CamillaDSP ──▶ UMC404HD
-                      (A2DP sink)   (libldacdec)      alsa_cdsp        convolution    24-bit/96 kHz
+sender ──LDAC/A2DP──▶ bluealsad ──▶ libldacBT_dec ──▶ ALSA "dsp96" ─┐
+                      (A2DP sink)   (libldacdec)      alsa_cdsp     │
+                                                                    ├─▶ CamillaDSP ──▶ UMC404HD
+computer ──USB──────▶ f_uac2 gadget ──▶ ALSA "hw:UAC2Gadget" ───────┘   convolution    24-bit/96 kHz
+                      (UAC2 sink)
 ```
+
+The two inputs are **alternatives**, not a mix — CamillaDSP opens the interface
+exclusively, so one player owns it at a time and the panel switches between
+them.
 
 ## Install
 
@@ -72,6 +80,10 @@ the service at the rebuilt one in `/usr/local/libexec`.
 | `/etc/systemd/system/bluetooth-sink-setup.service` | discoverable + pairable at boot |
 | `/etc/systemd/system/ldac-single-link.service` | holds the box to one device |
 | `/etc/systemd/system/ldac-audio-watchdog.service` | recovers a wedged player |
+| `/usr/local/sbin/ldac-usb-gadget` | builds the UAC2 gadget in configfs |
+| `/usr/local/sbin/ldac-usb-dac` | feeds USB audio through the same correction |
+| `/etc/systemd/system/ldac-usb-gadget.service` | binds the gadget at boot |
+| `/etc/systemd/system/ldac-usb-dac.service` | the USB player, started on demand |
 | `/usr/local/bin/node`, `/usr/local/share/ldac-web/` | the control panel |
 | `/usr/local/sbin/ldac-ctl` | its privileged half |
 | `/etc/default/ldac-receiver` | settings the panel writes |
@@ -299,6 +311,105 @@ despite not being documented as such. What is left is the namespace and mount
 half, which is the part that matters: a read-only system, no home directories,
 private `/tmp`. `ReadWritePaths=/etc/default` is the single hole, because the
 mount namespace applies to the sudo'd helper too and it has to save settings.
+
+## USB DAC input
+
+The board also presents itself to a computer as a USB Audio Class 2 sound card,
+stereo **S32_LE at 96 kHz** — the same format the rest of the chain uses, so
+nothing converts on the way in. Audio the host sends goes through the same
+`Test900.wav` correction, the same 2→4 mixer and the same uncorrected recorder
+tap on outputs 3–4 as Bluetooth does.
+
+### Which USB-C port
+
+**Only one of the board's two USB-C sockets can do this, and it is the one that
+also takes power.** There is exactly one USB device controller,
+`4100000.udc-controller` (a USB 2.0 `sunxi_usb_udc`), and it sits behind
+`10.usbc0` — Type-C `port1`. The other socket is the USB 3 / DisplayPort one on
+the `husb311` PD controller; its DWC3 is host-only here. Its role switch
+exposes no `role` attribute (the driver leaves `allow_userspace_control` off),
+and a Type-C data-role swap is refused — writing `device` to
+`/sys/class/typec/port0/data_role` is accepted, the port renegotiates, and it
+comes straight back as host.
+
+So the cable to the computer goes in the **power** socket, and the computer
+supplies the board's power as well as its data. Check it took:
+
+```sh
+cat /sys/class/udc/*/state      # "configured" = a host has enumerated us
+```
+
+`not attached` means no host session — nearly always the cable in the other
+socket. To see which socket is which without guessing:
+
+```sh
+ls /sys/devices/platform/soc@3000000/10.usbc0/typec   # the port with the UDC
+cat /sys/class/typec/port*/data_role
+```
+
+### Direction is easy to get backwards
+
+`f_uac2`'s `p_` and `c_` attributes are named from the **gadget's** point of
+view, not the host's. `p_chmask` gives the gadget a playback stream on the IN
+endpoint, which makes it a *microphone* to the host. A DAC is the other one:
+`c_chmask` gives it a capture stream fed by the OUT endpoint, the host sees a
+*speaker*, and the board gets an ALSA **capture** device (`hw:UAC2Gadget,0`).
+Setting the wrong one produces a gadget that enumerates perfectly and can never
+play anything.
+
+### Adaptive, not asynchronous
+
+The endpoint is `c_sync=adaptive`, which is not the better choice — it is the
+only one this board can do. Asynchronous sync needs a second, feedback IN
+endpoint beside the isochronous OUT one, and `sunxi_usb_udc` has none to spare:
+`f_uac2` fails its bind with `afunc_bind:1171 Error!` and `-ENODEV`. (The same
+controller also refuses both directions at once, failing at `:1182` — which is
+why the gadget offers no capture device to the host.)
+
+So the host free-runs at its own idea of 96 kHz while the UMC404HD consumes at
+its own, and the few tens of ppm between the two crystals would otherwise empty
+or overflow the buffer every few minutes and click. `ldac-usb-dac` therefore
+runs CamillaDSP with `enable_rate_adjust` and an `AsyncSinc` resampler, which
+watches the capture buffer level and trims the ratio — the job an asynchronous
+USB DAC does in hardware.
+
+The gadget's capture buffer is fixed at **8192 frames with a 512 frame period**
+(u_audio's constraint; `prealloc_max` is 64 KB and writing it changes nothing),
+so the USB path uses `chunksize: 2048` rather than the Bluetooth path's 4096.
+
+### One filter, two inputs
+
+`sbin/ldac-usb-dac` does **not** carry its own copy of the filters. It takes
+everything from `filters:` onwards out of the installed
+`/etc/camilladsp/roomcorr.yaml` and puts a USB `devices:` block in front — the
+same trick `tools/verify-convolution.sh` uses. Both inputs therefore get
+provably the same correction, and there is one file to edit.
+
+With correction switched off it plays into the `ldac96` ALSA device instead,
+whose ttable already widens stereo to four outputs, so the bypassed path needs
+no mixer and no filters of its own. The panel's single correction toggle means
+the same thing on either input.
+
+### Switching inputs
+
+```sh
+sudo ldac-ctl source usb          # or: bluetooth
+```
+
+The panel has the same control. Switching stops the other player first —
+CamillaDSP opens the interface exclusively, and starting the incoming player
+before the outgoing one lets go gives "Device or resource busy" and, with
+`Restart=always`, a restart loop. `LDAC_SOURCE` persists, and
+`bluetooth-sink-setup.service` re-applies it at boot because `bluealsa-aplay`
+is enabled and would otherwise grab the card first.
+
+`ldac-usb-dac` waits for the controller to report `configured` before starting
+CamillaDSP, so selecting USB with no computer attached leaves the interface
+free rather than holding it against a stream that will never arrive. The
+playback watchdog also stands down while USB is selected — with
+`bluealsa-aplay` deliberately stopped, a phone keeping its A2DP transport open
+looks exactly like the stall it recovers from, and "recovering" would start a
+fight over the card.
 
 ## One device at a time
 

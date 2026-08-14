@@ -9,7 +9,8 @@ string, and no subprocess is ever run through a shell.
 
 Verbs:
     status                      everything the panel displays, as JSON
-    convolution on|off          route Bluetooth audio through CamillaDSP or not
+    convolution on|off          route audio through CamillaDSP or not
+    source bluetooth|usb        which input feeds the interface
     discoverable on|off         adapter visibility, persisted across reboots
     volume set DB               interface output level, in dB (<= 0)
     volume mute on|off          interface output mute
@@ -45,7 +46,20 @@ PCM_DIRECT = "ldac96"
 
 MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
 SERVICES = ("bluetooth", "bluealsa", "bluealsa-aplay", "bt-agent", "ldac-web",
-            "ldac-single-link", "ldac-audio-watchdog")
+            "ldac-single-link", "ldac-audio-watchdog", "ldac-usb-gadget",
+            "ldac-usb-dac")
+
+# Which input feeds the interface.  These are alternatives rather than a mix:
+# CamillaDSP opens the UMC404HD exclusively, so the second one to try gets
+# "Device or resource busy" and plays nothing.  Switching stops one player
+# before starting the other.
+SOURCE_BLUETOOTH = "bluetooth"
+SOURCE_USB = "usb"
+PLAYER_UNIT = {SOURCE_BLUETOOTH: "bluealsa-aplay", SOURCE_USB: "ldac-usb-dac"}
+
+# The gadget's own ALSA card, created when ldac-usb-gadget binds it.
+GADGET_CARD = os.environ.get("LDAC_GADGET_CARD", "UAC2Gadget")
+GADGET_CONFIGFS = "/sys/kernel/config/usb_gadget/ldacrx"
 
 # How often watch-single-link looks at the adapter.  Two seconds is well under
 # the time it takes anyone to notice a second device connecting, and each pass
@@ -341,6 +355,16 @@ def cmd_watch_playback():
     strikes = 0
     last_ptr = None
     while not stopping["now"]:
+        # Only the Bluetooth path is watched.  With the USB DAC selected,
+        # bluealsa-aplay is deliberately stopped, so a phone that keeps its
+        # A2DP transport open would look exactly like the stall this recovers
+        # from — and "recovering" would start the player straight into a fight
+        # with CamillaDSP over the card.
+        if current_source() != SOURCE_BLUETOOTH:
+            strikes, last_ptr = 0, None
+            time.sleep(PLAYBACK_POLL_SECONDS)
+            continue
+
         streaming = stream_state().get("running", False)
         ptr = card_hw_ptr()
 
@@ -627,9 +651,50 @@ def services_state():
     return out
 
 
+def current_source():
+    value = read_defaults().get("LDAC_SOURCE", SOURCE_BLUETOOTH)
+    return value if value in PLAYER_UNIT else SOURCE_BLUETOOTH
+
+
+def udc_state():
+    """The device controller's view of the USB link, or None if there is none.
+
+    "configured" means a host has enumerated the gadget and chosen a
+    configuration, which is the only state in which audio can arrive.  "not
+    attached" means no host session at all -- on this board that most often
+    means the cable is in the wrong USB-C socket, since only the port that also
+    takes power has a device controller behind it.
+    """
+    try:
+        names = os.listdir("/sys/class/udc")
+    except OSError:
+        return None
+    for name in sorted(names):
+        try:
+            with open("/sys/class/udc/%s/state" % name) as fh:
+                return fh.read().strip()
+        except OSError:
+            continue
+    return None
+
+
+def usb_state():
+    state = udc_state()
+    return {
+        "gadget": os.path.isdir(GADGET_CONFIGFS),
+        "card": os.path.isdir("/proc/asound/%s" % GADGET_CARD),
+        "udc": state,
+        # What the panel actually needs to show: is a computer plugged in and
+        # talking to us.
+        "host": state == "configured",
+    }
+
+
 def cmd_status():
     return {
         "convolution": convolution_state(),
+        "source": current_source(),
+        "usb": usb_state(),
         "adapter": adapter_state(),
         "stream": stream_state(),
         "card": card_state(),
@@ -648,12 +713,38 @@ def want_on(word):
 def cmd_convolution(word):
     on = want_on(word)
     write_defaults({"LDAC_PCM": PCM_DSP if on else PCM_DIRECT})
-    # bluealsa-aplay picks the PCM up from the defaults file at start, so the
-    # change takes effect on restart.  This interrupts anything playing.
-    rc, _ = run(["systemctl", "restart", "bluealsa-aplay"], timeout=30)
+    # Both players read this at start and neither re-reads it, so the change
+    # takes effect on restart.  Restart only the one that owns the interface:
+    # starting the idle one would have it fight the active one for the card.
+    # This interrupts anything playing.
+    unit = PLAYER_UNIT[current_source()]
+    rc, _ = run(["systemctl", "restart", unit], timeout=30)
     if rc != 0:
-        fail("could not restart bluealsa-aplay")
-    return {"ok": True, "convolution": convolution_state()}
+        fail("could not restart %s" % unit)
+    return {"ok": True, "convolution": convolution_state(),
+            "source": current_source()}
+
+
+def apply_source(source):
+    """Hand the interface to one input, having taken it away from the other.
+
+    Order matters: the outgoing player has to release the card before the
+    incoming one opens it, or CamillaDSP starts, finds the device busy and
+    exits, and the unit's Restart=always turns that into a restart loop.
+    """
+    other = SOURCE_USB if source == SOURCE_BLUETOOTH else SOURCE_BLUETOOTH
+    run(["systemctl", "stop", PLAYER_UNIT[other]], timeout=30)
+    rc, _ = run(["systemctl", "restart", PLAYER_UNIT[source]], timeout=30)
+    return rc == 0
+
+
+def cmd_source(value):
+    if value not in PLAYER_UNIT:
+        fail("source must be 'bluetooth' or 'usb', got %r" % value)
+    write_defaults({"LDAC_SOURCE": value})
+    if not apply_source(value):
+        fail("could not start the %s player" % value)
+    return {"ok": True, "source": value, "usb": usb_state()}
 
 
 def cmd_discoverable(word):
@@ -717,7 +808,14 @@ def cmd_apply_boot():
     # alsa-restore has just written all four output attenuators from its saved
     # state, which does not know outputs 3-4 are a recorder tap.  Put them back.
     pin_tap_channels()
-    return {"ok": True, "adapter": adapter_state()}
+
+    # bluealsa-aplay is enabled at boot, so if USB was the chosen input it has
+    # to be handed the interface here — otherwise the Bluetooth player holds it
+    # and the USB DAC restart-loops against a busy card.
+    source = current_source()
+    if source != SOURCE_BLUETOOTH:
+        apply_source(source)
+    return {"ok": True, "adapter": adapter_state(), "source": source}
 
 
 def fail(message):
@@ -734,6 +832,8 @@ def main(argv):
         result = cmd_status()
     elif verb == "convolution" and len(args) == 1:
         result = cmd_convolution(args[0])
+    elif verb == "source" and len(args) == 1:
+        result = cmd_source(args[0])
     elif verb == "discoverable" and len(args) == 1:
         result = cmd_discoverable(args[0])
     elif verb == "volume" and len(args) == 2:

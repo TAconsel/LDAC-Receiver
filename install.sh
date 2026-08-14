@@ -68,10 +68,12 @@ if [[ $MODE == uninstall ]]; then
 	say "Stopping and disabling services"
 	sudo systemctl disable --now bluealsa-aplay.service bluealsa.service \
 		bt-agent.service bluetooth-sink-setup.service ldac-web.service \
-		ldac-single-link.service ldac-audio-watchdog.service 2>/dev/null || true
+		ldac-single-link.service ldac-audio-watchdog.service \
+		ldac-usb-gadget.service ldac-usb-dac.service 2>/dev/null || true
 
 	say "Removing the control panel"
 	sudo rm -rf "$WEB_DIR" /etc/sudoers.d/ldac-web /usr/local/sbin/ldac-ctl \
+		/usr/local/sbin/ldac-usb-gadget /usr/local/sbin/ldac-usb-dac \
 		"$DEFAULTS"
 	id -u "$WEB_USER" >/dev/null 2>&1 && sudo userdel "$WEB_USER" || true
 
@@ -83,6 +85,8 @@ if [[ $MODE == uninstall ]]; then
 		/etc/systemd/system/bluetooth-sink-setup.service \
 		/etc/systemd/system/ldac-single-link.service \
 		/etc/systemd/system/ldac-audio-watchdog.service \
+		/etc/systemd/system/ldac-usb-gadget.service \
+		/etc/systemd/system/ldac-usb-dac.service \
 		/etc/systemd/system/ldac-web.service
 	sudo rm -f /etc/asound.conf
 	# Back to the distribution bluetoothd.
@@ -268,6 +272,13 @@ id -u "$WEB_USER" >/dev/null 2>&1 ||
 # user, since sudo lets that user run it as root.
 sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-ctl" /usr/local/sbin/ldac-ctl
 
+# The USB DAC side: one script builds the UAC2 gadget so a host sees a sound
+# card, the other feeds what the host sends through the same room correction.
+sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-usb-gadget" \
+	/usr/local/sbin/ldac-usb-gadget
+sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-usb-dac" \
+	/usr/local/sbin/ldac-usb-dac
+
 sudo install -d "$WEB_DIR/public"
 sudo install -m 0644 "$HERE/web/server.js" "$WEB_DIR/server.js"
 sudo install -m 0644 "$HERE/web/public/index.html" "$WEB_DIR/public/index.html"
@@ -325,13 +336,18 @@ sudo install -m 0644 "$HERE/config/bt-agent.service" \
 	"$HERE/config/bluetooth-sink-setup.service" \
 	"$HERE/config/ldac-single-link.service" \
 	"$HERE/config/ldac-audio-watchdog.service" \
+	"$HERE/config/ldac-usb-gadget.service" \
+	"$HERE/config/ldac-usb-dac.service" \
 	"$HERE/config/ldac-web.service" /etc/systemd/system/
 
 sudo systemctl daemon-reload
 sudo systemctl restart bluetooth.service
 sudo systemctl enable --now bluetooth-sink-setup.service bt-agent.service \
 	ldac-single-link.service ldac-audio-watchdog.service \
+	ldac-usb-gadget.service \
 	bluealsa.service bluealsa-aplay.service ldac-web.service
+# ldac-usb-dac is deliberately NOT enabled: it holds the interface, and which
+# input owns it is a runtime choice made by `ldac-ctl source`.
 sudo systemctl restart bluealsa.service bluealsa-aplay.service ldac-web.service \
 	ldac-single-link.service
 
@@ -340,7 +356,7 @@ say "Verifying"
 sleep 2
 fail=0
 for u in bluetooth bluealsa bluealsa-aplay bt-agent ldac-web ldac-single-link \
-	ldac-audio-watchdog; do
+	ldac-audio-watchdog ldac-usb-gadget; do
 	if systemctl is-active --quiet "$u"; then
 		printf '  %-22s active\n' "$u"
 	else
