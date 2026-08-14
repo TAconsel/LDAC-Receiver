@@ -1,0 +1,75 @@
+/*
+ * Make the USB-C2 socket (the USB 3 / DisplayPort one) a USB *device* port, so
+ * a computer plugged into it sees this board as a sound card.
+ *
+ * Without this overlay that socket is host-only in practice.  Its DWC3 comes up
+ * in host mode, the usb_role switch exposes no `role` attribute for userspace to
+ * change (the driver leaves allow_userspace_control off), and a Type-C data-role
+ * swap is accepted and then immediately renegotiated back to host -- the partner
+ * keeps presenting Rd, so the board wins the role toss and turns VBUS on.  The
+ * only device controller the kernel then has is 4100000.udc-controller on
+ * usbc0, which is the *other* socket, the one that takes power.
+ *
+ * Two fragments, and both are needed:
+ *
+ *   husb311 connector   The Type-C port controller decides the roles before the
+ *                       USB controller ever sees them.  Pinning it to sink and
+ *                       device is what stops the board becoming the host; the
+ *                       DWC3 setting alone is not enough, because the connector
+ *                       would still hand it the host role.
+ *   xhci2-controller    The DWC3 itself.  `dr_mode = "peripheral"` makes it
+ *                       register a UDC instead of an xHCI root hub, and
+ *                       role-switch-default-mode keeps it there when the role
+ *                       switch has nothing to say.
+ *
+ * The board then draws its power from the computer through this socket as well.
+ * A dual-role variant that keeps PD power-role swapping (so the port can also
+ * charge a phone) is `power-role = "dual"; data-role = "dual"; try-power-role =
+ * "sink"; source-pdos = <0x22019032>;` -- it works, but it leaves the data role
+ * negotiable, and negotiating is exactly what went wrong before.
+ *
+ * Build and install:
+ *   dtc -q -@ -I dts -O dtb -o cubie-a7s-usbc2-device.dtbo cubie-a7s-usbc2-device.dts
+ *   sudo install -m644 cubie-a7s-usbc2-device.dtbo /boot/dtbo/
+ *   sudo u-boot-update        # writes the fdtoverlays line into extlinux.conf
+ *   sudo reboot
+ *
+ * A file in /boot/dtbo/ is enabled unless it ends in `.disabled`; u-boot-update
+ * scans that directory and rewrites /boot/extlinux/extlinux.conf, which carries
+ * the warning not to edit it by hand.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	metadata {
+		title = "USB-C2 device mode for the USB DAC";
+		compatible = "radxa,cubie-a7s";
+		category = "misc";
+		/* Only one overlay may own this port's role. */
+		exclusive = "usbc2-role";
+		description = "Force USB-C2 sink/device mode so a host sees the UAC2 audio gadget.";
+	};
+
+	fragment@0 {
+		target-path = "/soc@3000000/twi@7084000/husb311@4e/connector";
+
+		__overlay__ {
+			power-role = "sink";
+			data-role = "device";
+			try-power-role = "sink";
+		};
+	};
+
+	fragment@1 {
+		target-path = "/soc@3000000/usbc2@12/xhci2-controller@6a00000";
+
+		__overlay__ {
+			dr_mode = "peripheral";
+			role-switch-default-mode = "peripheral";
+		};
+	};
+};

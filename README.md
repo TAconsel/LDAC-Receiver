@@ -84,6 +84,7 @@ the service at the rebuilt one in `/usr/local/libexec`.
 | `/usr/local/sbin/ldac-usb-dac` | feeds USB audio through the same correction |
 | `/etc/systemd/system/ldac-usb-gadget.service` | binds the gadget at boot |
 | `/etc/systemd/system/ldac-usb-dac.service` | the USB player, started on demand |
+| `/boot/dtbo/cubie-a7s-usbc2-device.dtbo` | makes USB-C2 a device port (needs a reboot) |
 | `/usr/local/bin/node`, `/usr/local/share/ldac-web/` | the control panel |
 | `/usr/local/sbin/ldac-ctl` | its privileged half |
 | `/etc/default/ldac-receiver` | settings the panel writes |
@@ -320,32 +321,46 @@ nothing converts on the way in. Audio the host sends goes through the same
 `Test900.wav` correction, the same 2→4 mixer and the same uncorrected recorder
 tap on outputs 3–4 as Bluetooth does.
 
-### Which USB-C port
+### The USB-C2 socket needs a device-tree overlay
 
-**Only one of the board's two USB-C sockets can do this, and it is the one that
-also takes power.** There is exactly one USB device controller,
-`4100000.udc-controller` (a USB 2.0 `sunxi_usb_udc`), and it sits behind
-`10.usbc0` — Type-C `port1`. The other socket is the USB 3 / DisplayPort one on
-the `husb311` PD controller; its DWC3 is host-only here. Its role switch
-exposes no `role` attribute (the driver leaves `allow_userspace_control` off),
-and a Type-C data-role swap is refused — writing `device` to
-`/sys/class/typec/port0/data_role` is accepted, the port renegotiates, and it
-comes straight back as host.
+Out of the box the USB 3 / DisplayPort socket is **host-only**, and the only
+device controller is `4100000.udc-controller` — a USB 2.0 `sunxi_usb_udc` behind
+`10.usbc0`, which is the *other* socket, the one that takes power. Plug a
+computer into USB-C2 without the overlay and nothing enumerates in either
+direction: the DWC3 comes up as a host, its `usb_role` switch exposes no `role`
+attribute for userspace (the driver leaves `allow_userspace_control` off), and a
+Type-C data-role swap is accepted and then renegotiated straight back to host,
+because the partner keeps presenting Rd and the board wins the role toss.
 
-So the cable to the computer goes in the **power** socket, and the computer
-supplies the board's power as well as its data. Check it took:
+`config/cubie-a7s-usbc2-device.dts` fixes that. **Both** of its fragments are
+needed:
 
-```sh
-cat /sys/class/udc/*/state      # "configured" = a host has enumerated us
-```
-
-`not attached` means no host session — nearly always the cable in the other
-socket. To see which socket is which without guessing:
+| Node | Set to | Why |
+| --- | --- | --- |
+| `husb311@4e/connector` | `power-role = "sink"`, `data-role = "device"` | The Type-C port controller decides roles before the USB controller ever sees them. Setting DWC3 alone does nothing — the connector still hands it the host role. |
+| `xhci2-controller@6a00000` | `dr_mode = "peripheral"` | Makes DWC3 register a UDC instead of an xHCI root hub. |
 
 ```sh
-ls /sys/devices/platform/soc@3000000/10.usbc0/typec   # the port with the UDC
-cat /sys/class/typec/port*/data_role
+dtc -q -@ -I dts -O dtb -o cubie-a7s-usbc2-device.dtbo config/cubie-a7s-usbc2-device.dts
+sudo install -m644 cubie-a7s-usbc2-device.dtbo /boot/dtbo/
+sudo u-boot-update      # writes the fdtoverlays line into extlinux.conf
+sudo reboot
 ```
+
+A file in `/boot/dtbo/` is enabled unless it ends in `.disabled`; `u-boot-update`
+scans that directory and rewrites `extlinux.conf`, which warns against hand
+editing. `install.sh` does all of this and tells you a reboot is needed. After
+it, `/sys/class/udc/` has **two** entries and the gadget binds to
+`6a00000.xhci2-controller`.
+
+```sh
+cat /sys/class/udc/6a00000.xhci2-controller/state   # "configured" = host present
+```
+
+A dual-role variant (`power-role = "dual"`, `try-power-role = "sink"`,
+`source-pdos = <0x22019032>`) also works and keeps PD power-role swapping, so
+the port can still charge a phone — but it leaves the data role negotiable, and
+negotiating is exactly what fails.
 
 ### Direction is easy to get backwards
 
@@ -357,25 +372,36 @@ endpoint, which makes it a *microphone* to the host. A DAC is the other one:
 Setting the wrong one produces a gadget that enumerates perfectly and can never
 play anything.
 
-### Adaptive, not asynchronous
+### Asynchronous, when the controller allows it
 
-The endpoint is `c_sync=adaptive`, which is not the better choice — it is the
-only one this board can do. Asynchronous sync needs a second, feedback IN
-endpoint beside the isochronous OUT one, and `sunxi_usb_udc` has none to spare:
-`f_uac2` fails its bind with `afunc_bind:1171 Error!` and `-ENODEV`. (The same
-controller also refuses both directions at once, failing at `:1182` — which is
-why the gadget offers no capture device to the host.)
+`ldac-usb-gadget` asks for `c_sync=async` and settles for `adaptive` if the bind
+is refused, because which one is available depends on the controller it lands
+on. Async needs a feedback IN endpoint beside the isochronous OUT one:
 
-So the host free-runs at its own idea of 96 kHz while the UMC404HD consumes at
-its own, and the few tens of ppm between the two crystals would otherwise empty
-or overflow the buffer every few minutes and click. `ldac-usb-dac` therefore
-runs CamillaDSP with `enable_rate_adjust` and an `AsyncSinc` resampler, which
-watches the capture buffer level and trims the ratio — the job an asynchronous
-USB DAC does in hardware.
+* **DWC3** (USB-C2, with the overlay) has it. The gadget reports its real
+  consumption and the host follows — and that loop is closed through us, since
+  we drain at the interface's rate. This is what an asynchronous USB DAC does in
+  hardware, and it is what the board negotiates now.
+* **`sunxi_usb_udc`** (the power socket) has not a single endpoint to spare —
+  `f_uac2` fails its bind with `afunc_bind:1171 Error!` and `-ENODEV`, and also
+  refuses both directions at once, failing at `:1182`.
+
+`ldac-usb-dac` reads the sync type the gadget actually bound with and sets
+`enable_rate_adjust` accordingly: **off** for async, since a second control loop
+would fight the hardware one and the samples then reach the interface
+unresampled; **on**, with an `AsyncSinc` resampler, for adaptive, where the host
+free-runs and the tens of ppm between the two crystals would otherwise empty or
+overflow the buffer every few minutes and click.
 
 The gadget's capture buffer is fixed at **8192 frames with a 512 frame period**
-(u_audio's constraint; `prealloc_max` is 64 KB and writing it changes nothing),
-so the USB path uses `chunksize: 2048` rather than the Bluetooth path's 4096.
+regardless of controller (u_audio's constraint; `prealloc_max` is 64 KB and
+writing it changes nothing), so the USB path uses `chunksize: 2048` rather than
+the Bluetooth path's 4096, with `target_level: 4096` so the first seconds of a
+stream have something to absorb the host's feedback loop settling.
+
+Measured: a 90 s stream from a PipeWire host runs with **no underruns at all**
+once settled, CamillaDSP at ~10% of one core. Starting a stream after silence
+costs one "Prepare playback after buffer underrun".
 
 ### One filter, two inputs
 

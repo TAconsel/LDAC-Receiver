@@ -665,11 +665,20 @@ def udc_state():
     means the cable is in the wrong USB-C socket, since only the port that also
     takes power has a device controller behind it.
     """
+    # There can be two controllers on this board once the USB-C2 overlay is in
+    # place, and only the one the gadget is bound to means anything: the other
+    # reads "not attached" for ever and, sorting first, would make a live host
+    # session look absent.
+    try:
+        with open("%s/UDC" % GADGET_CONFIGFS) as fh:
+            bound = fh.read().strip()
+    except OSError:
+        bound = ""
     try:
         names = os.listdir("/sys/class/udc")
     except OSError:
         return None
-    for name in sorted(names):
+    for name in ([bound] if bound in names else sorted(names)):
         try:
             with open("/sys/class/udc/%s/state" % name) as fh:
                 return fh.read().strip()

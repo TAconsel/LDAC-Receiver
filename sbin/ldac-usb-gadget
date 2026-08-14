@@ -32,20 +32,18 @@ SRATE="${USB_GADGET_RATE:-96000}"
 SSIZE="${USB_GADGET_SSIZE:-4}"
 CHMASK="${USB_GADGET_CHMASK:-3}"        # front left + front right
 
-# Endpoint sync type.  `async` would be the better answer -- the gadget tells
-# the host how fast it is really consuming and the host follows, which is what
-# a good asynchronous USB DAC does, and it matters here because the sample clock
+# Endpoint sync type.  `async` is the one worth having: the gadget tells the
+# host how fast it is really consuming and the host follows, which is what a
+# good asynchronous USB DAC does, and it matters here because the sample clock
 # that counts belongs to the UMC404HD rather than to the PC.
 #
-# This board cannot do it.  Async needs a second, feedback IN endpoint beside
-# the isochronous OUT one, and sunxi_usb_udc has no endpoint left to give:
-# f_uac2 fails its bind with `afunc_bind:1171 Error!` and -ENODEV.  (The same
-# controller also refuses both directions at once, failing at :1182.)  So the
-# host free-runs at its own idea of 96 kHz, and the drift against the
-# interface's clock is absorbed downstream instead, by CamillaDSP's rate
-# adjustment -- see config/camilladsp-usb.yaml.  Do not "fix" this back to
-# async without checking that bind still succeeds.
-SYNC="${USB_GADGET_SYNC:-adaptive}"
+# Whether it is available depends on which controller we land on.  Async needs a
+# feedback IN endpoint beside the isochronous OUT one, and sunxi_usb_udc (the
+# power socket's USB 2.0 controller) has none to spare -- f_uac2 fails its bind
+# there with `afunc_bind:1171 Error!` and -ENODEV.  The DWC3 on USB-C2 has
+# plenty.  So "auto" asks for async and quietly settles for adaptive if the bind
+# is refused, and the rate adjustment in ldac-usb-dac covers the adaptive case.
+SYNC="${USB_GADGET_SYNC:-auto}"
 # Number of USB requests queued at once.  The default of 2 leaves no slack for a
 # board that is also decoding LDAC; 4 costs a few hundred microseconds of
 # latency and rides over scheduling jitter.
@@ -60,13 +58,30 @@ SERIAL="${USB_GADGET_SERIAL:-0001}"
 die() { echo "ldac-usb-gadget: $*" >&2; exit 1; }
 
 udc_name() {
-	# There is exactly one device controller on this board, and it belongs to
-	# the USB-C port that also takes power.  Empty means the kernel has no
-	# gadget-capable controller bound, which is a different failure from the
-	# host simply not being plugged in.
+	# Which device controller to bind to.  There can be two:
+	#
+	#   6a00000.dwc3 / xhci2-controller   the USB-C2 socket (USB 3 / DP), but
+	#                                     only once config/cubie-a7s-usbc2-device.dts
+	#                                     is installed as an overlay -- without it
+	#                                     that socket is host-only and this does
+	#                                     not exist.
+	#   4100000.udc-controller            the other USB-C socket, the one that
+	#                                     takes power.  Always present.
+	#
+	# Prefer the DWC3 when it is there: it is the socket a computer is normally
+	# plugged into, and it has endpoints to spare, which the USB 2.0 controller
+	# does not.  LDAC_UDC overrides for anything unusual.
+	if [[ -n ${LDAC_UDC:-} ]]; then
+		echo "$LDAC_UDC"
+		return
+	fi
 	local u
-	u=$(ls /sys/class/udc 2>/dev/null | head -1) || true
-	echo "$u"
+	for u in $(ls /sys/class/udc 2>/dev/null); do
+		case "$u" in
+		*dwc3*|*xhci2*) echo "$u"; return ;;
+		esac
+	done
+	ls /sys/class/udc 2>/dev/null | head -1
 }
 
 gadget_down() {
@@ -120,7 +135,6 @@ gadget_up() {
 	# No gadget playback: this is a DAC, so the host gets a speaker and no
 	# phantom microphone it might pick by accident as a recording source.
 	echo 0 > "$f/p_chmask"
-	echo "$SYNC"       > "$f/c_sync"       2>/dev/null || true
 	echo "$REQ_NUMBER" > "$f/req_number"   2>/dev/null || true
 	# Leave volume and mute out of the descriptors: with them the host's
 	# volume slider maps to a control that nothing in this path applies, so it
@@ -134,7 +148,20 @@ gadget_up() {
 	echo 250 > configs/c.1/MaxPower
 	ln -s functions/uac2.usb0 configs/c.1/
 
-	echo "$udc" > UDC
+	# Binding is where an impossible endpoint layout is discovered, so the sync
+	# type is chosen here by trying rather than by guessing from the controller
+	# name.  A refused bind leaves the gadget intact and unbound, so the retry
+	# only has to rewrite one attribute.
+	local order=("$SYNC")
+	[[ $SYNC == auto ]] && order=(async adaptive)
+	local s
+	for s in "${order[@]}"; do
+		echo "$s" > "$f/c_sync" 2>/dev/null || true
+		if echo "$udc" > UDC 2>/dev/null; then
+			return 0
+		fi
+	done
+	die "could not bind the gadget to $udc (tried sync: ${order[*]})"
 }
 
 case "${1:-}" in

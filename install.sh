@@ -364,6 +364,28 @@ for u in bluetooth bluealsa bluealsa-aplay bt-agent ldac-web ldac-single-link \
 	fi
 done
 
+# The USB-C2 socket is host-only until this overlay turns it into a device port,
+# and a device tree overlay only applies at boot -- so this is the one step that
+# needs a reboot.  It is installed but the reboot is left to the operator, since
+# this may be running on a box that is currently playing.
+say "Installing the USB-C2 device-mode overlay"
+if [[ -d /boot/dtbo ]] && command -v dtc >/dev/null && command -v u-boot-update >/dev/null; then
+	dtc -q -@ -I dts -O dtb -o "$HERE/build/cubie-a7s-usbc2-device.dtbo" \
+		"$HERE/config/cubie-a7s-usbc2-device.dts"
+	sudo install -m 0644 "$HERE/build/cubie-a7s-usbc2-device.dtbo" \
+		/boot/dtbo/cubie-a7s-usbc2-device.dtbo
+	sudo cp -n /boot/extlinux/extlinux.conf /boot/extlinux/extlinux.conf.pre-usbc2 || true
+	sudo u-boot-update
+	if [[ -e /sys/class/udc/6a00000.xhci2-controller ]]; then
+		echo "  USB-C2 is already a device port"
+	else
+		echo "  installed; USB-C2 becomes a device port after a reboot"
+		NEED_REBOOT=1
+	fi
+else
+	echo "  skipped: needs /boot/dtbo, dtc and u-boot-update (Radxa image)"
+fi
+
 # Outputs 3-4 are the uncorrected recorder tap and are held at unity; the panel
 # only ever moves 1-2.  Set it here so a fresh install starts out consistent
 # rather than waiting for the first apply-boot.
@@ -392,3 +414,9 @@ Control panel: http://$(hostname -I | awk '{print $1}'):8080/
   It has no password; see "Control panel" in README.md if that is not what
   you want on your network.
 EOF
+
+if [[ ${NEED_REBOOT:-0} == 1 ]]; then
+	echo
+	echo "Reboot to finish: the USB DAC input needs the USB-C2 overlay, which"
+	echo "only takes effect at boot.  Bluetooth works without it."
+fi
