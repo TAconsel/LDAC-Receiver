@@ -1,0 +1,175 @@
+#!/bin/bash
+# Hand power back to whatever is plugged into USB-C2, so a phone charges while
+# it plays into the DAC.
+#
+#   ldac-usb-charge watch    run in the foreground, for the unit
+#   ldac-usb-charge once     do one swap attempt and report
+#   ldac-usb-charge status   print the port's roles as JSON-ish key=value
+#
+# A phone acting as USB host is normally also the power source, so it feeds the
+# board and its own battery drains.  Reversing that means becoming a power
+# source while staying a data device, which USB-C only lets you do through a
+# Power Delivery PR_SWAP -- the two roles are independent, but only inside a PD
+# contract.  Hence config/cubie-a7s-usbc2-device-charge.dts, which makes the
+# connector genuinely dual-role while still *attaching* as a sink so the data
+# role comes out right.  This script asks for the swap once the link is up.
+#
+# Attaching as a sink and then swapping, rather than attaching as a source, is
+# deliberate: the source is the DFP, so attaching as one would make the board
+# the USB host and the audio would never start.
+#
+# SPDX-License-Identifier: MIT
+
+set -uo pipefail
+
+DEFAULTS="${DEFAULTS:-/etc/default/ldac-receiver}"
+POLL="${POLL:-3}"
+# How long to give the swap before deciding it broke the audio link.
+SETTLE="${SETTLE:-4}"
+# How many times to ask before treating it as a refusal.
+MAX_TRIES="${MAX_TRIES:-5}"
+
+log() { echo "ldac-usb-charge: $*"; }
+
+# The Type-C port that belongs to USB-C2.  Not hard-coded to port0: the index
+# depends on probe order.  usbc0 owns the *other* socket's port, so the one that
+# is not under it is ours.
+find_port() {
+	local p
+	for p in /sys/class/typec/port[0-9]*; do
+		[[ -d $p ]] || continue
+		[[ $(readlink -f "$p") == *usbc0* ]] && continue
+		echo "$p"
+		return 0
+	done
+	return 1
+}
+
+# Strip the sysfs "[current] other" formatting down to the current value.
+current_of() { sed -E 's/.*\[([a-z]+)\].*/\1/' "$1" 2>/dev/null; }
+
+partner_attached() {
+	local port="$1"
+	[[ -d ${port}-partner ]] && return 0
+	[[ -d $port/$(basename "$port")-partner ]] && return 0
+	return 1
+}
+
+gadget_ok() {
+	local bound
+	bound=$(cat /sys/kernel/config/usb_gadget/ldacrx/UDC 2>/dev/null) || return 1
+	[[ -n $bound ]] || return 1
+	[[ $(cat "/sys/class/udc/$bound/state" 2>/dev/null) == configured ]]
+}
+
+enabled() {
+	local v=on
+	# shellcheck disable=SC1090
+	[[ -f $DEFAULTS ]] && v=$(. "$DEFAULTS" 2>/dev/null; echo "${LDAC_USB_CHARGE:-on}")
+	[[ $v == on ]]
+}
+
+try_swap() {
+	local port="$1"
+	local power data mode
+	power=$(current_of "$port/power_role")
+	data=$(current_of "$port/data_role")
+	mode=$(cat "$port/power_operation_mode" 2>/dev/null)
+
+	# /sys/class/typec/portN-partner is a class symlink; the real node is a
+	# *child* of the port directory, and $port/.. resolves through the symlink to
+	# the device tree, not back to /sys/class/typec.  Accept either.
+	partner_attached "$port" || return 1
+	[[ $power == sink ]] || return 1
+	# No PD contract, no swap: a plain 5 V OTG source offers nothing to swap
+	# inside, and the write comes back EIO.  Not an error worth logging every
+	# few seconds, so this just declines quietly.
+	[[ $mode == usb_power_delivery ]] || return 1
+	# Only while the data role is what we need.  Swapping power is pointless if
+	# we are not the audio device anyway, and it risks disturbing a link that
+	# is doing something else.
+	[[ $data == device ]] || return 1
+
+	log "requesting PR_SWAP to source (data role stays $data)"
+	if ! echo source > "$port/power_role" 2>/dev/null; then
+		log "PR_SWAP refused by the partner"
+		return 1
+	fi
+	sleep "$SETTLE"
+
+	power=$(current_of "$port/power_role")
+	data=$(current_of "$port/data_role")
+	if [[ $power != source ]]; then
+		log "PR_SWAP did not stick (power role is $power)"
+		return 1
+	fi
+	# The swap must not have cost us the audio.  If the partner also flipped
+	# the data role, or the gadget dropped out, put the power role back rather
+	# than leave a link that charges but plays nothing.
+	if [[ $data != device ]] || ! gadget_ok; then
+		log "swap broke the device role or the gadget; reverting to sink"
+		echo sink > "$port/power_role" 2>/dev/null
+		return 1
+	fi
+	log "now sourcing power; the phone charges while it plays"
+	return 0
+}
+
+port_status() {
+	local port="$1" partner="$1-partner"
+	echo "port=$(basename "$port")"
+	echo "attached=$([[ -d $partner ]] && echo yes || echo no)"
+	echo "power_role=$(current_of "$port/power_role")"
+	echo "data_role=$(current_of "$port/data_role")"
+	echo "pd=$(cat "$port/power_operation_mode" 2>/dev/null)"
+	local d=/sys/class/power_supply/tcpm-source-psy-14-004e
+	if [[ -d $d ]]; then
+		echo "supply_mv=$(( $(cat "$d/voltage_now" 2>/dev/null || echo 0) / 1000 ))"
+		echo "supply_ma=$(( $(cat "$d/current_now" 2>/dev/null || echo 0) / 1000 ))"
+	fi
+}
+
+PORT=$(find_port) || { echo "ldac-usb-charge: no USB-C2 Type-C port found" >&2; exit 1; }
+
+case "${1:-watch}" in
+status) port_status "$PORT" ;;
+once)
+	enabled || { log "disabled by LDAC_USB_CHARGE"; exit 0; }
+	try_swap "$PORT" && exit 0 || exit 1
+	;;
+watch)
+	trap 'exit 0' TERM INT
+	# `tries` bounds how often a partner that has refused gets asked again.  It
+	# is cleared when the cable is pulled, which is the only event that makes a
+	# refusal worth reconsidering, and whenever we are already the source.
+	tries=0
+	while :; do
+		if ! partner_attached "$PORT"; then
+			# Cable out: forget any refusal, the next thing plugged in deserves
+			# its own attempts.
+			tries=0
+		elif enabled; then
+			if [[ $(current_of "$PORT/power_role") == source ]]; then
+				tries=0
+			elif (( tries < MAX_TRIES )); then
+				# A phone can take a few seconds after attach before it will
+				# entertain a PR_SWAP, so this is worth more than one go -- but
+				# not worth asking a partner that means "no" every 3 seconds
+				# for as long as it stays plugged in.
+				try_swap "$PORT" || tries=$(( tries + 1 ))
+				(( tries == MAX_TRIES )) && log "giving up until the cable is replugged"
+			fi
+		elif [[ $(current_of "$PORT/power_role") == source ]]; then
+			# Turned off while sourcing: give the power role back.
+			log "LDAC_USB_CHARGE is off; returning to sink"
+			echo sink > "$PORT/power_role" 2>/dev/null
+			tries=0
+		fi
+		sleep "$POLL"
+	done
+	;;
+*)
+	echo "usage: ldac-usb-charge watch|once|status" >&2
+	exit 1
+	;;
+esac

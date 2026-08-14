@@ -11,6 +11,7 @@ Verbs:
     status                      everything the panel displays, as JSON
     convolution on|off          route audio through CamillaDSP or not
     source bluetooth|usb        which input feeds the interface
+    usb-charge on|off           supply power to the device on USB-C2
     discoverable on|off         adapter visibility, persisted across reboots
     volume set DB               interface output level, in dB (<= 0)
     volume mute on|off          interface output mute
@@ -47,7 +48,7 @@ PCM_DIRECT = "ldac96"
 MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
 SERVICES = ("bluetooth", "bluealsa", "bluealsa-aplay", "bt-agent", "ldac-web",
             "ldac-single-link", "ldac-audio-watchdog", "ldac-usb-gadget",
-            "ldac-usb-dac")
+            "ldac-usb-dac", "ldac-usb-charge")
 
 # Which input feeds the interface.  These are alternatives rather than a mix:
 # CamillaDSP opens the UMC404HD exclusively, so the second one to try gets
@@ -687,6 +688,34 @@ def udc_state():
     return None
 
 
+def charge_state():
+    """The USB-C2 power arrangement, as the panel shows it.
+
+    Parsed from ldac-usb-charge rather than re-derived here: it already knows
+    which Type-C port belongs to USB-C2, which is not a fixed index.
+    """
+    want = read_defaults().get("LDAC_USB_CHARGE", "on") == "on"
+    out = {"enabled": want}
+    rc, text = run(["/usr/local/sbin/ldac-usb-charge", "status"])
+    if rc != 0:
+        out["available"] = False
+        return out
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        if key in ("attached", "power_role", "data_role", "pd"):
+            out[key] = value
+        elif key in ("supply_mv", "supply_ma"):
+            try:
+                out[key] = int(value)
+            except ValueError:
+                pass
+    out["available"] = True
+    # The one fact worth a sentence in the UI: are we feeding them or are they
+    # feeding us.
+    out["charging"] = out.get("power_role") == "source"
+    return out
+
+
 def usb_state():
     state = udc_state()
     return {
@@ -696,6 +725,7 @@ def usb_state():
         # What the panel actually needs to show: is a computer plugged in and
         # talking to us.
         "host": state == "configured",
+        "charge": charge_state(),
     }
 
 
@@ -745,6 +775,16 @@ def apply_source(source):
     run(["systemctl", "stop", PLAYER_UNIT[other]], timeout=30)
     rc, _ = run(["systemctl", "restart", PLAYER_UNIT[source]], timeout=30)
     return rc == 0
+
+
+def cmd_usb_charge(word):
+    on = want_on(word)
+    write_defaults({"LDAC_USB_CHARGE": "on" if on else "off"})
+    # The watcher re-reads the file every pass, so there is nothing to restart;
+    # it will request the swap, or give the power role back, within a few
+    # seconds.  Nudge it so the panel does not look unresponsive.
+    run(["systemctl", "reload-or-restart", "ldac-usb-charge"], timeout=30)
+    return {"ok": True, "usb": usb_state()}
 
 
 def cmd_source(value):
@@ -841,6 +881,8 @@ def main(argv):
         result = cmd_status()
     elif verb == "convolution" and len(args) == 1:
         result = cmd_convolution(args[0])
+    elif verb == "usb-charge" and len(args) == 1:
+        result = cmd_usb_charge(args[0])
     elif verb == "source" and len(args) == 1:
         result = cmd_source(args[0])
     elif verb == "discoverable" and len(args) == 1:

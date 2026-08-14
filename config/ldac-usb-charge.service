@@ -1,0 +1,32 @@
+# Installed as /etc/systemd/system/ldac-usb-charge.service
+#
+# Asks for a Power Delivery PR_SWAP once something is plugged into USB-C2, so
+# the board supplies power instead of drawing it — a phone then charges while it
+# plays into the DAC.  Needs config/cubie-a7s-usbc2-device-charge.dts to be the
+# installed overlay; with the strict one the connector is a fixed sink and the
+# swap comes back EIO.
+#
+# A watcher rather than a one-shot: the port goes back to sink every time the
+# cable is pulled, because the overlay attaches as a sink on purpose (attaching
+# as a source would make the board the USB host and there would be no audio).
+# So the swap has to be re-requested on each attach.
+#
+# It is not ordered against ldac-usb-dac.  The two are independent: this only
+# moves the power role, and it checks the gadget is still configured afterwards
+# rather than assuming anything about who started first.
+
+[Unit]
+Description=Charge the device attached to USB-C2 while it plays
+After=ldac-usb-gadget.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ldac-usb-charge watch
+Restart=always
+RestartSec=5
+# Returns the power role to sink on the way out, so stopping the service leaves
+# the port as the device tree describes it.
+ExecStop=/bin/sh -c 'p=$(ls -d /sys/class/typec/port[0-9]* | while read d; do case "$(readlink -f $d)" in *usbc0*) ;; *) echo $d;; esac; done | head -1); [ -n "$p" ] && echo sink > "$p/power_role" 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

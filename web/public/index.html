@@ -184,6 +184,16 @@
         <span class="track"></span>
       </label>
     </div>
+    <div class="row" id="chargerow" hidden>
+      <div class="grow">
+        <div class="label">Charge the connected device</div>
+        <div class="hint" id="chargehint">—</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="charge" disabled>
+        <span class="track"></span>
+      </label>
+    </div>
   </section>
 
   <section>
@@ -384,6 +394,13 @@ $('mute').addEventListener('click', () => {
   }), null);
 });
 
+$('charge').addEventListener('change', (e) => {
+  const on = e.target.checked;
+  act(() => api('/api/usb-charge', {
+    method: 'POST', body: JSON.stringify({ enabled: on }),
+  }), on ? 'Charging the connected device' : 'No longer supplying power');
+});
+
 document.querySelectorAll('#srcseg button').forEach((b) => {
   b.addEventListener('click', () => {
     const source = b.dataset.source;
@@ -466,6 +483,31 @@ function renderSource(s) {
   }
 }
 
+function renderCharge(usb) {
+  const c = (usb && usb.charge) || {};
+  const row = $('chargerow');
+  // Hidden entirely where the port cannot do it, rather than shown as a dead
+  // switch: without the charging overlay there is nothing to toggle.
+  row.hidden = !c.available;
+  if (!c.available) return;
+  $('charge').checked = !!c.enabled;
+  $('charge').disabled = busy;
+  if (!c.enabled) {
+    $('chargehint').textContent = 'Off — the connected device powers the board instead';
+  } else if (c.attached !== 'yes') {
+    $('chargehint').textContent = 'On — nothing plugged into the USB-C port yet';
+  } else if (c.charging) {
+    const w = c.supply_mv && c.supply_ma
+      ? ` — ${(c.supply_mv / 1000).toFixed(1)} V at ${c.supply_ma} mA`
+      : '';
+    $('chargehint').textContent = `Supplying power${w}`;
+  } else if (c.pd !== 'usb_power_delivery') {
+    $('chargehint').textContent = 'Waiting — the device is not using Power Delivery, so the roles cannot swap';
+  } else {
+    $('chargehint').textContent = 'Waiting for the device to accept the power swap';
+  }
+}
+
 function render(s) {
   const a = s.adapter || {};
   $('devname').textContent = a.name || 'LDAC Receiver';
@@ -499,6 +541,7 @@ function render(s) {
       : 'Hidden. Already-paired clients can still connect.';
   }
 
+  renderCharge(s.usb);
   renderVolume(s.volume);
   renderFacts(s);
   renderClients(s.devices);

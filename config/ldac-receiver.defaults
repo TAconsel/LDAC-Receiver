@@ -32,3 +32,11 @@ LDAC_VOLUME_MODE=software
 # which interrupts whatever was playing. Room correction (LDAC_PCM above)
 # applies to both.
 LDAC_SOURCE=bluetooth
+
+# Whether to hand power back to whatever is plugged into USB-C2, so a phone
+# charges while it plays into the DAC. Done with a Power Delivery PR_SWAP, so it
+# needs the charging overlay (config/cubie-a7s-usbc2-device-charge.dts) and a
+# partner that speaks PD; a plain 5 V OTG source offers no contract to swap
+# inside and the request is declined. What the board offers is fixed in that
+# overlay's source-pdos, currently 5 V at 500 mA.
+LDAC_USB_CHARGE=on

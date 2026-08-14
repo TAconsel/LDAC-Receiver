@@ -69,11 +69,13 @@ if [[ $MODE == uninstall ]]; then
 	sudo systemctl disable --now bluealsa-aplay.service bluealsa.service \
 		bt-agent.service bluetooth-sink-setup.service ldac-web.service \
 		ldac-single-link.service ldac-audio-watchdog.service \
-		ldac-usb-gadget.service ldac-usb-dac.service 2>/dev/null || true
+		ldac-usb-gadget.service ldac-usb-dac.service \
+		ldac-usb-charge.service 2>/dev/null || true
 
 	say "Removing the control panel"
 	sudo rm -rf "$WEB_DIR" /etc/sudoers.d/ldac-web /usr/local/sbin/ldac-ctl \
 		/usr/local/sbin/ldac-usb-gadget /usr/local/sbin/ldac-usb-dac \
+		/usr/local/sbin/ldac-usb-charge \
 		"$DEFAULTS"
 	id -u "$WEB_USER" >/dev/null 2>&1 && sudo userdel "$WEB_USER" || true
 
@@ -87,6 +89,7 @@ if [[ $MODE == uninstall ]]; then
 		/etc/systemd/system/ldac-audio-watchdog.service \
 		/etc/systemd/system/ldac-usb-gadget.service \
 		/etc/systemd/system/ldac-usb-dac.service \
+		/etc/systemd/system/ldac-usb-charge.service \
 		/etc/systemd/system/ldac-web.service
 	sudo rm -f /etc/asound.conf
 	# Back to the distribution bluetoothd.
@@ -278,6 +281,8 @@ sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-usb-gadget" \
 	/usr/local/sbin/ldac-usb-gadget
 sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-usb-dac" \
 	/usr/local/sbin/ldac-usb-dac
+sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-usb-charge" \
+	/usr/local/sbin/ldac-usb-charge
 
 sudo install -d "$WEB_DIR/public"
 sudo install -m 0644 "$HERE/web/server.js" "$WEB_DIR/server.js"
@@ -338,13 +343,14 @@ sudo install -m 0644 "$HERE/config/bt-agent.service" \
 	"$HERE/config/ldac-audio-watchdog.service" \
 	"$HERE/config/ldac-usb-gadget.service" \
 	"$HERE/config/ldac-usb-dac.service" \
+	"$HERE/config/ldac-usb-charge.service" \
 	"$HERE/config/ldac-web.service" /etc/systemd/system/
 
 sudo systemctl daemon-reload
 sudo systemctl restart bluetooth.service
 sudo systemctl enable --now bluetooth-sink-setup.service bt-agent.service \
 	ldac-single-link.service ldac-audio-watchdog.service \
-	ldac-usb-gadget.service \
+	ldac-usb-gadget.service ldac-usb-charge.service \
 	bluealsa.service bluealsa-aplay.service ldac-web.service
 # ldac-usb-dac is deliberately NOT enabled: it holds the interface, and which
 # input owns it is a runtime choice made by `ldac-ctl source`.
@@ -356,7 +362,7 @@ say "Verifying"
 sleep 2
 fail=0
 for u in bluetooth bluealsa bluealsa-aplay bt-agent ldac-web ldac-single-link \
-	ldac-audio-watchdog ldac-usb-gadget; do
+	ldac-audio-watchdog ldac-usb-gadget ldac-usb-charge; do
 	if systemctl is-active --quiet "$u"; then
 		printf '  %-22s active\n' "$u"
 	else
@@ -370,10 +376,18 @@ done
 # this may be running on a box that is currently playing.
 say "Installing the USB-C2 device-mode overlay"
 if [[ -d /boot/dtbo ]] && command -v dtc >/dev/null && command -v u-boot-update >/dev/null; then
-	dtc -q -@ -I dts -O dtb -o "$HERE/build/cubie-a7s-usbc2-device.dtbo" \
-		"$HERE/config/cubie-a7s-usbc2-device.dts"
-	sudo install -m 0644 "$HERE/build/cubie-a7s-usbc2-device.dtbo" \
-		/boot/dtbo/cubie-a7s-usbc2-device.dtbo
+	# The charging variant is the default: it does everything the strict one
+	# does and additionally lets a phone charge.  Set USBC2_OVERLAY=device for
+	# the strict sink/device version.  Only one may be enabled -- they both
+	# claim exclusive = "usbc2-role".
+	USBC2_OVERLAY="${USBC2_OVERLAY:-device-charge}"
+	dtc -q -@ -I dts -O dtb -o "$HERE/build/cubie-a7s-usbc2-$USBC2_OVERLAY.dtbo" \
+		"$HERE/config/cubie-a7s-usbc2-$USBC2_OVERLAY.dts"
+	for old in /boot/dtbo/cubie-a7s-usbc2-*.dtbo; do
+		[[ -e $old ]] && sudo mv "$old" "$old.disabled"
+	done
+	sudo install -m 0644 "$HERE/build/cubie-a7s-usbc2-$USBC2_OVERLAY.dtbo" \
+		"/boot/dtbo/cubie-a7s-usbc2-$USBC2_OVERLAY.dtbo"
 	sudo cp -n /boot/extlinux/extlinux.conf /boot/extlinux/extlinux.conf.pre-usbc2 || true
 	sudo u-boot-update
 	if [[ -e /sys/class/udc/6a00000.xhci2-controller ]]; then

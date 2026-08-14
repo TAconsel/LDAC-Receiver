@@ -2,8 +2,9 @@
 
 Turns the board into an A2DP **sink** that accepts LDAC, applies FIR room
 correction, and plays the result out of a USB audio interface at
-**24-bit / 96 kHz**. It is also a **USB DAC**: a computer on the OTG port sees
-a 24-bit/96 kHz sound card and gets the same correction.
+**24-bit / 96 kHz**. It is also a **USB DAC**: a computer or phone on the USB-C2 port sees a
+24-bit/96 kHz sound card and gets the same correction — and a phone charges
+while it plays.
 
 Verified on a Radxa Cubie A7S (Allwinner A733, Debian 11 bullseye, aarch64,
 BlueZ 5.55, AIC8800D80 Bluetooth) with a Behringer UMC404HD, receiving from a
@@ -84,7 +85,9 @@ the service at the rebuilt one in `/usr/local/libexec`.
 | `/usr/local/sbin/ldac-usb-dac` | feeds USB audio through the same correction |
 | `/etc/systemd/system/ldac-usb-gadget.service` | binds the gadget at boot |
 | `/etc/systemd/system/ldac-usb-dac.service` | the USB player, started on demand |
-| `/boot/dtbo/cubie-a7s-usbc2-device.dtbo` | makes USB-C2 a device port (needs a reboot) |
+| `/usr/local/sbin/ldac-usb-charge` | swaps the power role so a phone charges |
+| `/etc/systemd/system/ldac-usb-charge.service` | watches the port and re-requests it |
+| `/boot/dtbo/cubie-a7s-usbc2-device-charge.dtbo` | makes USB-C2 a device port (needs a reboot) |
 | `/usr/local/bin/node`, `/usr/local/share/ldac-web/` | the control panel |
 | `/usr/local/sbin/ldac-ctl` | its privileged half |
 | `/etc/default/ldac-receiver` | settings the panel writes |
@@ -415,6 +418,55 @@ With correction switched off it plays into the `ldac96` ALSA device instead,
 whose ttable already widens stereo to four outputs, so the bypassed path needs
 no mixer and no filters of its own. The panel's single correction toggle means
 the same thing on either input.
+
+### Charging the phone while it plays
+
+A phone acting as USB host is normally also the power source, so it feeds the
+board and its own battery drains. Reversing that means becoming a power
+**source** while staying a data **device** — two independent USB-C roles that
+can only be decoupled through a Power Delivery `PR_SWAP`.
+
+`config/cubie-a7s-usbc2-device-charge.dts` is the overlay that allows it, and is
+what `install.sh` enables by default (`USBC2_OVERLAY=device` selects the strict
+one instead; only one may be enabled). The difference that matters:
+
+| | strict `-device` | `-device-charge` |
+| --- | --- | --- |
+| `power-role` | `sink` | `dual` — so a PR_SWAP is legal at all |
+| `try-power-role` | — | `sink` — still *attach* as a sink |
+| `source-pdos` | — | 5 V @ 500 mA |
+
+Attaching as a sink and swapping afterwards is deliberate: the source is the
+DFP, so attaching as a source would make the board the USB *host* and the audio
+would never start. With the strict overlay the connector is a fixed sink and
+writing to `power_role` returns `EIO`.
+
+`ldac-usb-charge` watches the port and requests the swap once a partner is
+attached, there is a PD contract, and the board is the data device. It checks
+afterwards that the data role survived and the gadget is still `configured`, and
+puts the power role back if either broke — a link that charges but plays nothing
+is not the trade wanted. The port returns to sink on every unplug (that is the
+point of `try-power-role`), so the swap is re-requested on each attach; a partner
+that refuses is asked five times and then left alone until the cable is pulled.
+
+Switch it with the panel, or:
+
+```sh
+sudo ldac-ctl usb-charge on     # or: off
+sudo ldac-usb-charge status     # roles, PD state, and what is being supplied
+```
+
+**It only works if the phone speaks PD.** A plain 5 V OTG source offers no
+contract to swap inside. Curiously, this phone reported `supports_usb_power_
+delivery: no` under the strict overlay and `yes` under the charging one — the
+board has to be PD-capable itself before the negotiation happens at all.
+
+**Current is deliberately low: 5 V @ 500 mA (2.5 W), trickle charging.**
+Everything the board hands out comes from its own supply on the other USB-C
+socket. Raising it means editing `source-pdos` (the .dts lists the values for
+900 mA through 3 A), rebuilding and rebooting — the PDO lives in the device tree
+and this kernel has no `/sys/class/usb_power_delivery` to change it at runtime.
+Check what the board's own supply can spare first.
 
 ### Switching inputs
 

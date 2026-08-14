@@ -123,13 +123,17 @@ async function handleApi(req, res, url) {
 
   const body = await readBody(req);
 
-  if (url.pathname === '/api/convolution' || url.pathname === '/api/discoverable') {
+  const TOGGLES = {
+    '/api/convolution': 'convolution',
+    '/api/discoverable': 'discoverable',
+    '/api/usb-charge': 'usb-charge',
+  };
+  if (url.pathname in TOGGLES) {
     const state = onOff(body.enabled);
     if (state === null) {
       return sendJson(res, 400, { ok: false, error: '"enabled" must be true or false' });
     }
-    const verb = url.pathname === '/api/convolution' ? 'convolution' : 'discoverable';
-    return sendJson(res, 200, await ctl([verb, state]));
+    return sendJson(res, 200, await ctl([TOGGLES[url.pathname], state]));
   }
 
   if (url.pathname === '/api/source') {

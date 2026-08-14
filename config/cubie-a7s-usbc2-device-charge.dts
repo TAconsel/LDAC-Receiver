@@ -1,0 +1,82 @@
+/*
+ * USB-C2 as a device port that can also *supply* power, so a phone plugged in
+ * plays into the DAC and charges at the same time.
+ *
+ * This is the charging variant of cubie-a7s-usbc2-device.dts.  Only one of the
+ * two may be installed -- they both claim `exclusive = "usbc2-role"`.
+ *
+ * The problem it solves: when a phone is the USB host it is normally also the
+ * power source, so it feeds the board and its own battery drains.  Reversing
+ * that means the board must present as a power *source* while staying a data
+ * *device*, which USB-C treats as two independent roles that can only be
+ * decoupled through Power Delivery -- a PR_SWAP.  The strict variant cannot do
+ * it: with `power-role = "sink"` fixed in the device tree, tcpm refuses the
+ * swap outright and writing to /sys/class/typec/port0/power_role returns EIO.
+ *
+ * So here the connector is a genuine dual-role port:
+ *
+ *   power-role = "dual"     both directions allowed, so a PR_SWAP is legal
+ *   try-power-role = "sink" but *attach* as a sink, which makes the board the
+ *                           UFP and therefore the USB device -- the data role a
+ *                           DAC needs.  Attaching as a source would make the
+ *                           board the host, and the audio would never start.
+ *   source-pdos             what to offer once we do become the source
+ *   data-role = "dual"      a DR_SWAP stays available as a fallback if the
+ *                           phone insists on driving the data role itself
+ *
+ * The swap is then requested from userspace once the link is up -- see
+ * sbin/ldac-usb-charge.  It only works if the phone speaks Power Delivery on
+ * this link; a plain 5 V OTG source offers no contract to swap inside.
+ *
+ * source-pdos = <0x22019032> is a Fixed Supply PDO: 5 V at 500 mA (2.5 W), with
+ * the dual-role power and dual-role data bits set.  It is deliberately modest,
+ * because this board is itself powered from the other USB-C socket and every
+ * milliamp it hands out comes from there -- offer more than that supply can
+ * spare and the board browns out mid-track.  The voltage is bits 19:10 in 50 mV
+ * units and the current the low 10 bits in 10 mA units, so at 5 V:
+ *
+ *     0x22019032    500 mA    2.5 W   (this one; safe on any supply)
+ *     0x2201905A    900 mA    4.5 W
+ *     0x22019096   1500 mA    7.5 W
+ *     0x220190C8   2000 mA   10.0 W
+ *     0x2201912C   3000 mA   15.0 W
+ *
+ * Raising it takes a rebuild and a reboot -- the PDO lives in the device tree,
+ * and this kernel has no /sys/class/usb_power_delivery to change it at runtime.
+ * Measure the board's own supply first.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	metadata {
+		title = "USB-C2 device mode with phone charging";
+		compatible = "radxa,cubie-a7s";
+		category = "misc";
+		exclusive = "usbc2-role";
+		description = "USB-C2 attaches as an audio device, then allows a PD power-role swap so an attached phone charges.";
+	};
+
+	fragment@0 {
+		target-path = "/soc@3000000/twi@7084000/husb311@4e/connector";
+
+		__overlay__ {
+			power-role = "dual";
+			data-role = "dual";
+			try-power-role = "sink";
+			source-pdos = <0x22019032>;
+		};
+	};
+
+	fragment@1 {
+		target-path = "/soc@3000000/usbc2@12/xhci2-controller@6a00000";
+
+		__overlay__ {
+			dr_mode = "otg";
+			role-switch-default-mode = "peripheral";
+		};
+	};
+};
