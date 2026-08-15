@@ -67,21 +67,37 @@ QUEUELIMIT="${QUEUELIMIT:-4}"
 die() { echo "ldac-usb-dac: $*" >&2; exit 1; }
 
 # How the drift between the host's clock and the interface's gets corrected.
-# Three cases, probed rather than assumed, in order of preference:
 #
-#   pitch     u_audio gives the gadget capture device a "Capture Pitch 1000000"
-#             ALSA control, and CamillaDSP drives it when enable_rate_adjust is
-#             on: it watches its own buffer level and asks the *host* to send
-#             slightly faster or slower.  Nothing is resampled -- the correction
-#             happens at the source, which is the whole point of an async DAC.
-#   none      async endpoint but no pitch control: u_audio's own feedback is the
-#             only loop, and a second one here would fight it.
-#   resample  adaptive endpoint and no pitch control: the host free-runs, so the
-#             drift has to be absorbed by an async resampler here.
+# NOT with the gadget's "Capture Pitch 1000000" control, even though u_audio
+# offers one and CamillaDSP will happily drive it when enable_rate_adjust is on.
+# Measured on this board: force the pitch to 1005000 (+5000 ppm) and record the
+# capture device, and the recording comes back with a 1.00 ms hole every 200 ms
+# -- 116 of them in 25 s, which is exactly 5000 ppm expressed as inserted
+# silence.  u_audio implements the pitch by punching holes in the stream rather
+# than by scaling what the feedback endpoint reports, so *any* correction it
+# applies is audible as a skip, and CamillaDSP cannot see it happening because
+# the kernel does it below the capture device.  Even the +30 ppm steady state
+# this settles at is a 1 ms gap every 33 seconds.
+#
+# So there are two usable modes:
+#
+#   none      let the endpoint's own async feedback be the only loop and accept
+#             that a slow drift eventually empties the buffer.  With a 171 ms
+#             playback buffer and tens of ppm of drift that is one underrun
+#             every tens of minutes -- a single tick, against a hole every half
+#             minute.  This is the default.
+#   resample  absorb the drift inside CamillaDSP with an async resampler.  Only
+#             reachable when the capture device has no pitch control, because
+#             CamillaDSP prefers the device's own mechanism when one exists.
+#
+# LDAC_DRIFT_MODE overrides, mostly so the pitch behaviour can be re-measured
+# without editing this file.
 drift_mode() {
-	if amixer -c "$GADGET_CARD" controls 2>/dev/null | grep -q "Capture Pitch"; then
-		echo pitch
-	elif [[ $(cat /sys/kernel/config/usb_gadget/ldacrx/functions/uac2.usb0/c_sync \
+	local forced
+	# shellcheck disable=SC1090
+	[[ -f $DEFAULTS ]] && forced=$(. "$DEFAULTS" 2>/dev/null; echo "${LDAC_DRIFT_MODE:-}")
+	if [[ -n ${forced:-} ]]; then echo "$forced"; return; fi
+	if [[ $(cat /sys/kernel/config/usb_gadget/ldacrx/functions/uac2.usb0/c_sync \
 		2>/dev/null) == async ]]; then
 		echo none
 	else
@@ -103,15 +119,9 @@ write_config() {
 	case "$(drift_mode)" in
 	pitch)
 		RATE_ADJUST_BLOCK=$(cat <<'YAML'
-  # The gadget capture device has a "Capture Pitch 1000000" control, so drift is
-  # corrected by asking the host to change rate -- nothing is resampled. Watch
-  # it work with: amixer -c UAC2Gadget cget numid=1
-  #
-  # adjust_period is deliberately long. The correction is applied by the *host*,
-  # which changes its output rate to comply, and a rate that keeps moving is
-  # heard as wow on sustained notes. Drift between two crystals is tens of ppm
-  # per minute, so there is nothing to chase quickly: correct slowly and the
-  # modulation stays far below audibility.
+  # Drives the gadget's Capture Pitch control. Kept only so the behaviour can be
+  # re-measured: on this board u_audio implements pitch as inserted silence, one
+  # 1 ms hole per 200 ms at 5000 ppm, so this is audible. Do not use it.
   enable_rate_adjust: true
   adjust_period: 60
 YAML

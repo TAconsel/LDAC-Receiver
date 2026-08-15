@@ -389,23 +389,34 @@ on. Async needs a feedback IN endpoint beside the isochronous OUT one:
   `f_uac2` fails its bind with `afunc_bind:1171 Error!` and `-ENODEV`, and also
   refuses both directions at once, failing at `:1182`.
 
-**Drift is corrected without resampling.** `u_audio` gives the gadget capture
-device a `Capture Pitch 1000000` ALSA control (numid 1, range 750000–1005000),
-and CamillaDSP drives it when `enable_rate_adjust` is on — it watches its own
-buffer level and asks the *host* to send slightly faster or slower, which is
-what the feedback endpoint is for. Nothing is resampled: the correction happens
-at the source. CamillaDSP confirms it at startup with `Capture device supports
-rate adjust`, and you can watch it work:
+**Do not use the gadget's pitch control to correct drift.** `u_audio` gives the
+capture device a `Capture Pitch 1000000` control, CamillaDSP finds it
+(`Capture device supports rate adjust`) and will drive it whenever
+`enable_rate_adjust` is on. It looks like exactly the right mechanism — correct
+at the source, resample nothing. It is not. Measured here: force the pitch to
+`1005000` and record the capture device directly, and the recording comes back
+with a **1.00 ms hole every 200 ms**, 116 of them in 25 s. That is 5000 ppm
+expressed as *inserted silence*. `u_audio` punches holes in the stream rather
+than scaling what the feedback endpoint reports, so any correction it applies is
+audible as a skip — and CamillaDSP cannot see it, because the kernel does it
+below the capture device. Even the +30 ppm this settles at is a 1 ms gap every
+33 seconds.
 
 ```sh
-amixer -c UAC2Gadget cget numid=1      # 1000000 = exactly nominal
+# reproduce
+amixer -c UAC2Gadget cset numid=1 1005000
+arecord -D hw:UAC2Gadget,0 -f S32_LE -r 96000 -c 2 -d 25 /tmp/cap.raw
+amixer -c UAC2Gadget cset numid=1 1000000
 ```
 
-`ldac-usb-dac` probes for that control and picks one of three modes, rather than
-assuming: **pitch** (the above), **none** (async but no pitch control — the
-hardware loop is the only one, and a second would fight it), or **resample**
-(adaptive and no pitch control — an `AsyncSinc` resampler absorbs the drift
-here, the only case where anything is resampled).
+So `ldac-usb-dac` leaves `enable_rate_adjust: false` on an async endpoint and
+lets the endpoint's own feedback be the only loop, accepting that a slow drift
+eventually empties the buffer: with a 171 ms playback buffer and tens of ppm,
+that is one underrun every tens of minutes — a single tick, against a hole every
+half minute. `LDAC_DRIFT_MODE` (`none` / `resample` / `pitch`) overrides, mostly
+so the pitch behaviour can be re-measured. `resample` absorbs the drift inside
+CamillaDSP instead, but is only reachable when the capture device has no pitch
+control, because CamillaDSP prefers the device's own mechanism when one exists.
 
 The gadget's capture buffer is fixed at **8192 frames with a 512 frame period**
 regardless of controller (u_audio's constraint; `prealloc_max` is 64 KB and
