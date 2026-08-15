@@ -35,19 +35,28 @@ RATE="${RATE:-96000}"
 # feeds the recorder tap -- so the bypassed path needs no mixer and no filters
 # here, and there is nothing to keep in sync.
 
-# The gadget's capture buffer tops out at 8192 frames with a 512 frame period
-# (u_audio fixes this; prealloc_max is 64 KB and cannot be raised), so the
-# chunk has to be small enough that CamillaDSP's ALSA buffer fits inside it.
-# 2048 frames is 21 ms and leaves the 32768 tap filter at 16 partitions.
-CHUNKSIZE="${CHUNKSIZE:-2048}"
+# CamillaDSP sizes both ALSA buffers from the chunk, so this is the knob that
+# sets how much slack the interface has: at 4096 the playback buffer comes out
+# at 16384 frames, 171 ms, twice what 2048 gave.  That is the margin that
+# absorbs a late write without the card running dry, which is what a click is.
+#
+# It also makes the convolution cheaper -- 32768 taps over 4096-sample
+# partitions is 8 segments instead of 16 -- and costs latency, which for a music
+# receiver already carrying a 45 ms linear-phase filter is not the binding
+# constraint.
+#
+# The capture side cannot follow it up: u_audio fixes the gadget's buffer at
+# 8192 frames with a 512 frame period (prealloc_max is 64 KB and writing it
+# changes nothing), so CamillaDSP asks for 16384 there, is refused, and settles
+# for 8192 -- two chunks.  That is the reason not to go higher than 4096.
+CHUNKSIZE="${CHUNKSIZE:-4096}"
 
-# How full CamillaDSP tries to keep the interface's playback buffer.  The
-# default is one chunk, which leaves nothing to absorb the first few seconds of
-# a stream while the host's feedback loop is still settling -- that showed up as
-# a couple of "Prepare playback after buffer underrun" warnings, and a click,
-# in the first ~15 s and none afterwards.  Two chunks costs 21 ms of latency and
-# still fits inside the card's 8192 frame buffer.
-TARGET_LEVEL="${TARGET_LEVEL:-4096}"
+# How full CamillaDSP keeps the interface's playback buffer.  CamillaDSP's
+# default is one chunk, which leaves nothing to absorb a late write; two chunks
+# is the level the rate correction then holds it at, so it is half the buffer
+# and there is as much room to drain into as to grow into.  Scaled with the
+# chunk rather than fixed, so changing one does not silently unbalance the other.
+TARGET_LEVEL="${TARGET_LEVEL:-$((CHUNKSIZE * 2))}"
 
 # Chunks allowed to sit between the capture and playback threads.  1 is the
 # lowest latency and leaves the playback thread nothing to fall back on when it
@@ -97,8 +106,14 @@ write_config() {
   # The gadget capture device has a "Capture Pitch 1000000" control, so drift is
   # corrected by asking the host to change rate -- nothing is resampled. Watch
   # it work with: amixer -c UAC2Gadget cget numid=1
+  #
+  # adjust_period is deliberately long. The correction is applied by the *host*,
+  # which changes its output rate to comply, and a rate that keeps moving is
+  # heard as wow on sustained notes. Drift between two crystals is tens of ppm
+  # per minute, so there is nothing to chase quickly: correct slowly and the
+  # modulation stays far below audibility.
   enable_rate_adjust: true
-  adjust_period: 10
+  adjust_period: 60
 YAML
 		)
 		;;
