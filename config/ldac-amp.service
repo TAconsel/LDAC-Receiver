@@ -1,0 +1,30 @@
+# Installed as /etc/systemd/system/ldac-amp.service
+#
+# Drives a relay on the 30-pin header so the power amplifier is on only while
+# something is connected — a host on the USB port or a Bluetooth link — and off
+# 60 s after the last one goes away.
+#
+# Deliberately independent of which input is *selected*: the amplifier should be
+# on if a phone is paired and playing over Bluetooth even while the panel has
+# USB chosen, because the alternative is silence with no obvious cause.
+#
+# The line is held for the lifetime of this service rather than set and
+# forgotten. Releasing a sunxi pin leaves it at whatever it was last driven to,
+# so a set-and-exit would appear to work and then drift; and holding it means
+# stopping the service can put the amplifier back down on the way out.
+
+[Unit]
+Description=Amplifier relay for the LDAC receiver
+After=bluetooth.service ldac-usb-gadget.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ldac-amp watch
+Restart=always
+RestartSec=5
+# Belt and braces: if the process is killed rather than stopped cleanly, put the
+# relay down anyway so a crash cannot leave the amplifier powered indefinitely.
+ExecStopPost=-/usr/local/sbin/ldac-amp off
+
+[Install]
+WantedBy=multi-user.target

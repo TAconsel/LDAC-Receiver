@@ -86,6 +86,8 @@ the service at the rebuilt one in `/usr/local/libexec`.
 | `/etc/systemd/system/ldac-usb-gadget.service` | binds the gadget at boot |
 | `/etc/systemd/system/ldac-usb-dac.service` | the USB player, started on demand |
 | `/usr/local/sbin/ldac-usb-charge` | swaps the power role so a phone charges |
+| `/usr/local/sbin/ldac-amp` | amplifier relay on header pin 26 |
+| `/etc/systemd/system/ldac-amp.service` | switches it on connect, off after 60 s |
 | `/etc/systemd/system/ldac-usb-charge.service` | watches the port and re-requests it |
 | `/boot/dtbo/cubie-a7s-usbc2-device-charge.dtbo` | makes USB-C2 a device port (needs a reboot) |
 | `/usr/local/bin/node`, `/usr/local/share/ldac-web/` | the control panel |
@@ -521,6 +523,78 @@ playback watchdog also stands down while USB is selected — with
 `bluealsa-aplay` deliberately stopped, a phone keeping its A2DP transport open
 looks exactly like the stall it recovers from, and "recovering" would start a
 fight over the card.
+
+## Amplifier relay
+
+The amplifier is switched by a relay on the **30-pin header**, on as soon as
+anything connects and off once nothing has been connected for 60 s.
+
+### Which pin, and why that one
+
+**Physical pin 26 — PD14 — `gpiochip0` line 110.**
+
+| | |
+| --- | --- |
+| Signal | **pin 26** |
+| Ground | pin 25 (directly opposite) or pin 30 |
+| Relay power | pin 2 or 4 (+5 V), pin 1 or 17 (+3.3 V) |
+
+It is not an arbitrary choice. Of the free pins on the header — PD10–PD17,
+PJ22–PJ25, PB5 — **pin 26 is the only one that reads `0` when nothing is
+driving it**; the others idle high. For an amplifier relay that is the whole
+argument: with an active-high board the amp stays off through boot, through a
+reboot, and any time this service is not running. PB0/PB1/PB9/PB10 are the
+UART0 console and PL5–PL7 are JTAG, so those are out regardless.
+
+Reference it by name rather than by number — the kernel labels these lines
+after the header pin, so this survives any bank renumbering:
+
+```sh
+gpiofind PIN_26          # -> gpiochip0 110
+gpioinfo 0 | grep PIN_26
+```
+
+### Wiring
+
+Most cheap opto-isolated relay boards are **active low**: their input is pulled
+up on the board and the relay energises when the pin is driven low. Set
+`LDAC_AMP_ACTIVE_LOW=on` for those and the script keeps talking in terms of
+on/off. For an active-high board leave it `off` and add a **10 kΩ pull-down**
+from pin 26 to ground — the pin idles low but is not strongly held, and a
+resistor makes "amplifier off" the guaranteed state when nothing owns the line.
+
+Test the wiring before trusting it to the logic:
+
+```sh
+sudo systemctl stop ldac-amp
+sudo ldac-amp on ; sleep 2 ; sudo ldac-amp off
+sudo systemctl start ldac-amp
+```
+
+### What counts as connected
+
+Either input, regardless of which one the panel has selected — a phone playing
+over Bluetooth should power the amplifier even if USB is the chosen source,
+because the alternative is silence with no obvious cause.
+
+* **USB** — the device controller reports `configured`, i.e. a host has
+  enumerated the audio gadget
+* **Bluetooth** — any ACL link exists
+
+On is immediate, so the amplifier is settled before the first note. Off waits
+`LDAC_AMP_OFF_DELAY` (60 s), which rides over a track change, a brief unplug, or
+a phone dropping and re-pairing.
+
+The line is **held** for the service's lifetime rather than set and released:
+releasing a sunxi pin leaves it at whatever it was last driven to — drive it
+high, release it, and it still reads high — so a set-and-exit would work by
+accident. Holding it also means stopping the service puts the amplifier down,
+and `ExecStopPost` does it again in case the process was killed rather than
+stopped.
+
+```sh
+sudo ldac-amp status      # what it sees, and the resolved line
+```
 
 ## One device at a time
 

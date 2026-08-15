@@ -70,12 +70,12 @@ if [[ $MODE == uninstall ]]; then
 		bt-agent.service bluetooth-sink-setup.service ldac-web.service \
 		ldac-single-link.service ldac-audio-watchdog.service \
 		ldac-usb-gadget.service ldac-usb-dac.service \
-		ldac-usb-charge.service 2>/dev/null || true
+		ldac-usb-charge.service ldac-amp.service 2>/dev/null || true
 
 	say "Removing the control panel"
 	sudo rm -rf "$WEB_DIR" /etc/sudoers.d/ldac-web /usr/local/sbin/ldac-ctl \
 		/usr/local/sbin/ldac-usb-gadget /usr/local/sbin/ldac-usb-dac \
-		/usr/local/sbin/ldac-usb-charge \
+		/usr/local/sbin/ldac-usb-charge /usr/local/sbin/ldac-amp \
 		"$DEFAULTS"
 	id -u "$WEB_USER" >/dev/null 2>&1 && sudo userdel "$WEB_USER" || true
 
@@ -90,6 +90,7 @@ if [[ $MODE == uninstall ]]; then
 		/etc/systemd/system/ldac-usb-gadget.service \
 		/etc/systemd/system/ldac-usb-dac.service \
 		/etc/systemd/system/ldac-usb-charge.service \
+		/etc/systemd/system/ldac-amp.service \
 		/etc/systemd/system/ldac-web.service
 	sudo rm -f /etc/asound.conf
 	# Back to the distribution bluetoothd.
@@ -283,6 +284,8 @@ sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-usb-dac" \
 	/usr/local/sbin/ldac-usb-dac
 sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-usb-charge" \
 	/usr/local/sbin/ldac-usb-charge
+# Amplifier relay on the 30-pin header.
+sudo install -m 0755 -o root -g root "$HERE/sbin/ldac-amp" /usr/local/sbin/ldac-amp
 
 sudo install -d "$WEB_DIR/public"
 sudo install -m 0644 "$HERE/web/server.js" "$WEB_DIR/server.js"
@@ -344,13 +347,14 @@ sudo install -m 0644 "$HERE/config/bt-agent.service" \
 	"$HERE/config/ldac-usb-gadget.service" \
 	"$HERE/config/ldac-usb-dac.service" \
 	"$HERE/config/ldac-usb-charge.service" \
+	"$HERE/config/ldac-amp.service" \
 	"$HERE/config/ldac-web.service" /etc/systemd/system/
 
 sudo systemctl daemon-reload
 sudo systemctl restart bluetooth.service
 sudo systemctl enable --now bluetooth-sink-setup.service bt-agent.service \
 	ldac-single-link.service ldac-audio-watchdog.service \
-	ldac-usb-gadget.service ldac-usb-charge.service \
+	ldac-usb-gadget.service ldac-usb-charge.service ldac-amp.service \
 	bluealsa.service bluealsa-aplay.service ldac-web.service
 # ldac-usb-dac is deliberately NOT enabled: it holds the interface, and which
 # input owns it is a runtime choice made by `ldac-ctl source`.
@@ -362,7 +366,7 @@ say "Verifying"
 sleep 2
 fail=0
 for u in bluetooth bluealsa bluealsa-aplay bt-agent ldac-web ldac-single-link \
-	ldac-audio-watchdog ldac-usb-gadget ldac-usb-charge; do
+	ldac-audio-watchdog ldac-usb-gadget ldac-usb-charge ldac-amp; do
 	if systemctl is-active --quiet "$u"; then
 		printf '  %-22s active\n' "$u"
 	else

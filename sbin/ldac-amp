@@ -1,0 +1,123 @@
+#!/bin/bash
+# Switch the power amplifier on when something is connected, off when nothing
+# has been for a while.
+#
+#   ldac-amp watch     run in the foreground, for the unit
+#   ldac-amp status    print what it sees, as key=value
+#   ldac-amp on|off    force the relay, for wiring up and testing
+#
+# "Connected" means either input has a device attached, not that it is playing:
+#   USB       the device controller reports `configured`, i.e. a host has
+#             enumerated the audio gadget
+#   Bluetooth any ACL link exists
+#
+# Turning on is immediate, so the amplifier is ready before the first note.
+# Turning off waits LDAC_AMP_OFF_DELAY (60 s), which keeps the relay still
+# through a track change, a brief unplug, or a phone that drops and re-pairs.
+#
+# SPDX-License-Identifier: MIT
+
+set -uo pipefail
+
+DEFAULTS="${DEFAULTS:-/etc/default/ldac-receiver}"
+POLL="${POLL:-2}"
+
+setting() {
+	local key="$1" fallback="$2" value=""
+	# shellcheck disable=SC1090
+	[[ -f $DEFAULTS ]] && value=$(. "$DEFAULTS" 2>/dev/null; echo "${!key:-}")
+	echo "${value:-$fallback}"
+}
+
+# The kernel names these lines after the header pin, so PIN_26 is physical pin
+# 26 whatever the bank arithmetic works out to.  A raw "gpiochip0 110" also
+# works if a future kernel drops the names.
+PIN="$(setting LDAC_AMP_PIN PIN_26)"
+OFF_DELAY="$(setting LDAC_AMP_OFF_DELAY 60)"
+ACTIVE_LOW="$(setting LDAC_AMP_ACTIVE_LOW off)"
+
+resolve_line() {
+	if [[ $PIN == *" "* ]]; then
+		echo "$PIN"
+		return 0
+	fi
+	gpiofind "$PIN" 2>/dev/null
+}
+
+LINE="$(resolve_line)"
+[[ -n $LINE ]] || { echo "ldac-amp: cannot resolve GPIO '$PIN'" >&2; exit 1; }
+# gpioset's --active-low makes 1 mean "assert", so the rest of this script can
+# talk in terms of amplifier on/off and never about volts.  Relay boards come
+# both ways round; the cheap opto-isolated ones are usually active low.
+GPIOARGS=()
+[[ $ACTIVE_LOW == on ]] && GPIOARGS+=(--active-low)
+
+HOLDER=""
+
+# The line has to be *held*, not set and released: releasing it leaves the pin
+# with whatever it last had (measured -- drive it high, release, and it still
+# reads high), so a set-and-exit would work by accident and drift by accident
+# too.  gpioset --mode=signal keeps the request open until it is killed.
+drive() {
+	local value="$1"
+	[[ -n $HOLDER ]] && { kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; }
+	gpioset "${GPIOARGS[@]}" --mode=signal $LINE="$value" &
+	HOLDER=$!
+}
+
+usb_present() {
+	local bound
+	bound=$(cat /sys/kernel/config/usb_gadget/ldacrx/UDC 2>/dev/null) || return 1
+	[[ -n $bound ]] || return 1
+	[[ $(cat "/sys/class/udc/$bound/state" 2>/dev/null) == configured ]]
+}
+
+bt_present() {
+	hcitool con 2>/dev/null | grep -q "ACL"
+}
+
+case "${1:-watch}" in
+status)
+	echo "pin=$PIN"
+	echo "line=$LINE"
+	echo "active_low=$ACTIVE_LOW"
+	echo "off_delay=$OFF_DELAY"
+	echo "usb=$(usb_present && echo yes || echo no)"
+	echo "bluetooth=$(bt_present && echo yes || echo no)"
+	# Reading the line back needs it free, so this only reports when nothing
+	# is holding it -- i.e. when the watcher is not running.
+	echo "level=$(gpioget $LINE 2>/dev/null || echo held)"
+	;;
+on|off)
+	v=0; [[ $1 == on ]] && v=1
+	gpioset "${GPIOARGS[@]}" $LINE=$v
+	echo "amplifier $1 (line $LINE = $v${ACTIVE_LOW:+, active_low=$ACTIVE_LOW})"
+	;;
+watch)
+	[[ $(setting LDAC_AMP on) == on ]] || { echo "ldac-amp: disabled by LDAC_AMP"; exit 0; }
+	# Leave the amplifier off on the way out rather than stranding it on.
+	trap 'drive 0; sleep 0.2; kill $HOLDER 2>/dev/null; exit 0' TERM INT
+
+	state=off
+	drive 0
+	echo "ldac-amp: watching, off after ${OFF_DELAY}s idle, line $LINE"
+	idle_since=$SECONDS
+	while :; do
+		if usb_present || bt_present; then
+			idle_since=$SECONDS
+			if [[ $state == off ]]; then
+				state=on; drive 1
+				echo "ldac-amp: device connected -> amplifier on"
+			fi
+		elif [[ $state == on ]] && (( SECONDS - idle_since >= OFF_DELAY )); then
+			state=off; drive 0
+			echo "ldac-amp: nothing connected for ${OFF_DELAY}s -> amplifier off"
+		fi
+		sleep "$POLL"
+	done
+	;;
+*)
+	echo "usage: ldac-amp watch|status|on|off" >&2
+	exit 1
+	;;
+esac

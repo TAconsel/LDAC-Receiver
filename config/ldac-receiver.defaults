@@ -47,3 +47,25 @@ LDAC_USB_CHARGE=on
 # doubles how often the uncorrected clock drift empties the buffer (one tick).
 # 1024 is the sensible floor. Restart ldac-usb-dac to apply.
 LDAC_CHUNKSIZE=2048
+
+# --- amplifier relay -------------------------------------------------------
+# Switch a power amplifier with a relay on the 30-pin header: on as soon as a
+# device connects (USB host enumerated, or any Bluetooth link), off once
+# nothing has been connected for LDAC_AMP_OFF_DELAY seconds.
+LDAC_AMP=on
+
+# Which header pin drives the relay. The kernel names these lines after the
+# physical pin, so PIN_26 is pin 26 (PD14) regardless of bank numbering; a raw
+# "gpiochip0 110" also works. Pin 26 is chosen because it is the only free
+# header pin that reads LOW when nothing drives it, so an active-high relay
+# board stays off through boot and while this service is not running.
+LDAC_AMP_PIN=PIN_26
+
+# Set to "on" for the common opto-isolated relay boards whose input is pulled
+# up and energises when driven low. With "off" the relay energises on a high.
+LDAC_AMP_ACTIVE_LOW=off
+
+# Seconds with nothing connected before the amplifier is switched off. Long
+# enough to ride over a track change, a brief unplug, or a phone dropping and
+# re-pairing.
+LDAC_AMP_OFF_DELAY=60
