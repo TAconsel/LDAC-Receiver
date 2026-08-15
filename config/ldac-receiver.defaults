@@ -40,3 +40,10 @@ LDAC_SOURCE=bluetooth
 # inside and the request is declined. What the board offers is fixed in that
 # overlay's source-pdos, currently 5 V at 500 mA.
 LDAC_USB_CHARGE=on
+
+# USB DAC latency/robustness trade. CamillaDSP sizes the ALSA buffers from this:
+# the interface's buffer is 4x it and is held half full, so 2048 frames at
+# 96 kHz is ~21 ms of chunk plus ~43 ms of fill. Halving it halves that and
+# doubles how often the uncorrected clock drift empties the buffer (one tick).
+# 1024 is the sensible floor. Restart ldac-usb-dac to apply.
+LDAC_CHUNKSIZE=2048

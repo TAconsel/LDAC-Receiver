@@ -35,10 +35,10 @@ RATE="${RATE:-96000}"
 # feeds the recorder tap -- so the bypassed path needs no mixer and no filters
 # here, and there is nothing to keep in sync.
 
-# CamillaDSP sizes both ALSA buffers from the chunk, so this is the knob that
-# sets how much slack the interface has: at 4096 the playback buffer comes out
-# at 16384 frames, 171 ms, twice what 2048 gave.  That is the margin that
-# absorbs a late write without the card running dry, which is what a click is.
+# CamillaDSP sizes both ALSA buffers from the chunk, so this is the knob for
+# both latency and slack: the playback buffer comes out at 4x the chunk, and the
+# level it is held at (target_level below) at 2x.  2048 gives an 8192 frame
+# buffer held at 4096, so ~21 ms of chunk plus ~43 ms of fill.
 #
 # It also makes the convolution cheaper -- 32768 taps over 4096-sample
 # partitions is 8 segments instead of 16 -- and costs latency, which for a music
@@ -49,7 +49,19 @@ RATE="${RATE:-96000}"
 # 8192 frames with a 512 frame period (prealloc_max is 64 KB and writing it
 # changes nothing), so CamillaDSP asks for 16384 there, is refused, and settles
 # for 8192 -- two chunks.  That is the reason not to go higher than 4096.
-CHUNKSIZE="${CHUNKSIZE:-4096}"
+#
+# Tunable without editing this file: set LDAC_CHUNKSIZE in /etc/default/ldac-
+# receiver and restart. Halving it halves the buffer latency and doubles how
+# often the uncorrected drift empties the buffer, so it trades a tick every so
+# often against responsiveness. Keep it a power of two, and no lower than 1024:
+# below that the 32768 tap filter needs 32+ segments and the period drops under
+# 11 ms, which is where the scheduler starts to matter again.
+CHUNKSIZE="${CHUNKSIZE:-}"
+if [[ -z $CHUNKSIZE && -f $DEFAULTS ]]; then
+	# shellcheck disable=SC1090
+	CHUNKSIZE=$(. "$DEFAULTS" 2>/dev/null; echo "${LDAC_CHUNKSIZE:-}")
+fi
+CHUNKSIZE="${CHUNKSIZE:-2048}"
 
 # How full CamillaDSP keeps the interface's playback buffer.  CamillaDSP's
 # default is one chunk, which leaves nothing to absorb a late write; two chunks
