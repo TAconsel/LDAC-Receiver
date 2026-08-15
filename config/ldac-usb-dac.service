@@ -42,3 +42,20 @@ Nice=-10
 # option left.
 LimitRTPRIO=99
 LimitMEMLOCK=infinity
+# rtkit is the route CamillaDSP tries, and it refuses any client whose
+# RLIMIT_RTTIME is infinite -- that limit is its safeguard against a runaway
+# real-time thread locking a core, and systemd leaves it unlimited by default.
+# Setting it to rtkit's own ceiling makes the request eligible: an identical
+# transient unit (systemd-run with these same limits) does get all three threads
+# promoted.  From this unit it still does not -- rtkit reports "Supervising 0
+# threads of 0 processes" -- so the limit is necessary but not sufficient here,
+# and the reason is not established.
+LimitRTTIME=200000
+# So the policy is set directly instead, which needs no rtkit and cannot fail
+# quietly.  systemd applies it to the main process and every thread inherits it.
+# Priority 5 is low in the real-time band: enough to preempt ordinary work and
+# meet an 85 ms deadline, far below anything the kernel needs, and these threads
+# block on ALSA rather than spin, so they cannot monopolise a core.  Nice above
+# is then ignored, and kept only as the fallback if this is ever removed.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=5
